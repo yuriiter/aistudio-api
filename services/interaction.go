@@ -53,6 +53,7 @@ const NETWORK_SPY_SCRIPT = `
 			// Attach listener BEFORE send
 			const xhr = this;
 			let lastLength = 0;
+			let captureTimeout = null;
 			
 			this.addEventListener('readystatechange', function() {
 				console.log('[Spy] ReadyState:', this.readyState, 'Status:', this.status);
@@ -65,6 +66,18 @@ const NETWORK_SPY_SCRIPT = `
 							window._AI_ACCUMULATOR = currentText;
 							lastLength = currentText.length;
 							console.log('[Spy] Streaming... accumulated', lastLength, 'bytes');
+							
+							// Reset timeout - we're still getting data
+							if (captureTimeout) {
+								clearTimeout(captureTimeout);
+							}
+							// Mark as done if no new data comes for 2 seconds
+							captureTimeout = setTimeout(() => {
+								if (window._AI_ACCUMULATOR.length > 0 && !window._AI_CAPTURE_DONE) {
+									console.log('[Spy] No new data for 2s, marking complete with', window._AI_ACCUMULATOR.length, 'bytes');
+									window._AI_CAPTURE_DONE = true;
+								}
+							}, 2000);
 						}
 					} catch (e) {
 						console.log('[Spy] Error reading responseText in state 3:', e);
@@ -73,6 +86,7 @@ const NETWORK_SPY_SCRIPT = `
 				
 				// State 4 = DONE
 				if (this.readyState === 4) {
+					if (captureTimeout) clearTimeout(captureTimeout);
 					console.log('[Spy] XHR Complete, status:', this.status);
 					console.log('[Spy] Response length:', this.responseText ? this.responseText.length : 0);
 					window._AI_ACCUMULATOR = this.responseText || "";
@@ -80,10 +94,17 @@ const NETWORK_SPY_SCRIPT = `
 					console.log('[Spy] Captured', window._AI_ACCUMULATOR.length, 'bytes');
 				}
 				
-				// State 0 = UNSENT/ABORTED - if we have data, mark as done
+				// State 0 = UNSENT/ABORTED - if we have data, wait a bit then mark as done
 				if (this.readyState === 0 && window._AI_ACCUMULATOR.length > 0) {
-					console.log('[Spy] XHR aborted, but we have', window._AI_ACCUMULATOR.length, 'bytes');
-					window._AI_CAPTURE_DONE = true;
+					if (captureTimeout) clearTimeout(captureTimeout);
+					console.log('[Spy] XHR aborted, we have', window._AI_ACCUMULATOR.length, 'bytes');
+					// Don't mark as done immediately - give it a moment
+					setTimeout(() => {
+						if (!window._AI_CAPTURE_DONE) {
+							console.log('[Spy] Finalizing after abort');
+							window._AI_CAPTURE_DONE = true;
+						}
+					}, 500);
 				}
 			});
 			
@@ -217,9 +238,9 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 	// Wait for the capture to complete
 	fmt.Println(">> UI says done. Waiting for network capture to complete...")
 
-	// Wait for capture done flag or timeout
+	// Wait for capture done flag or timeout (longer timeout for slower models)
 	captureComplete := false
-	for i := 0; i < 50; i++ { // 50 * 200ms = 10 seconds max
+	for i := 0; i < 60; i++ { // 60 * 200ms = 12 seconds max
 		done, err := page.Evaluate("window._AI_CAPTURE_DONE")
 		if err == nil {
 			if isDone, ok := done.(bool); ok && isDone {
@@ -235,7 +256,7 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 		fmt.Println(">> WARNING: Capture done flag not set, reading anyway...")
 	}
 
-	// Give a bit more time for any final chunks to arrive
+	// Give extra time for data to stabilize
 	time.Sleep(1 * time.Second)
 
 	// Read captured data
@@ -255,6 +276,14 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 	}
 
 	fmt.Printf(">> Successfully captured %d bytes from network\n", len(rawText))
+
+	// Validate that we have complete JSON (ends with ])
+	trimmed := strings.TrimSpace(rawText)
+	if !strings.HasSuffix(trimmed, "]") && !strings.HasSuffix(trimmed, "}") {
+		fmt.Printf(">> WARNING: Response may be incomplete (doesn't end with ] or })\n")
+		fmt.Printf(">> Last 50 chars: ...%s\n", trimmed[len(trimmed)-50:])
+		return "", fmt.Errorf("incomplete JSON response (ends with: %s)", trimmed[len(trimmed)-20:])
+	}
 
 	// Optional: Print preview for debugging
 	if len(rawText) > 0 && len(rawText) < 500 {
