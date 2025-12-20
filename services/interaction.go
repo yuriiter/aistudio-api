@@ -283,7 +283,6 @@ func parseGoogleRPCResponse(body []byte) (string, error) {
 	if idx := strings.Index(rawStr, "["); idx != -1 {
 		rawStr = rawStr[idx:]
 	} else {
-		// Sometimes it might just be the array, but if not found, we fail
 		return "", fmt.Errorf("invalid JSON structure - no array found")
 	}
 
@@ -293,55 +292,39 @@ func parseGoogleRPCResponse(body []byte) (string, error) {
 		return "", fmt.Errorf("json parse error: %v (Length: %d)", err, len(rawStr))
 	}
 
-	// 3. Find the response text
-	text := findLongestText(raw)
-	if text == "" {
-		return "", fmt.Errorf("parsed JSON but found no valid text content")
+	// 3. Find all [null, "text"] pairs and concatenate
+	var textChunks []string
+	findTextChunks(raw, &textChunks)
+
+	if len(textChunks) == 0 {
+		return "", fmt.Errorf("no text chunks found in response")
 	}
 
-	return text, nil
+	// Concatenate all chunks
+	fullText := strings.Join(textChunks, "")
+	return fullText, nil
 }
 
-// findLongestText performs a DFS on the nested array to find the actual response string
-func findLongestText(data interface{}) string {
-	var allTexts []string
-	collectTexts(data, &allTexts)
-
-	// Filter and find the best response
-	var longest string
-	for _, text := range allTexts {
-		// Skip metadata
-		if strings.HasPrefix(text, "v1_") || text == "model" || len(text) < 2 {
-			continue
-		}
-
-		// Skip "Drafting" thoughts and similar internal reasoning
-		lower := strings.ToLower(text)
-		if strings.Contains(lower, "drafting") ||
-			strings.Contains(lower, "i've decided") ||
-			strings.Contains(lower, "i'm going to") {
-			continue
-		}
-
-		// Prefer content that looks like actual output
-		if len(text) > len(longest) {
-			longest = text
-		}
-	}
-
-	return longest
-}
-
-// collectTexts recursively collects all string values from nested structure
-func collectTexts(data interface{}, texts *[]string) {
+// findTextChunks recursively finds all arrays of form [null, "text"] and collects the text
+func findTextChunks(data interface{}, chunks *[]string) {
 	switch v := data.(type) {
 	case []interface{}:
-		for _, item := range v {
-			collectTexts(item, texts)
+		// Check if this is a [null, string] pair
+		if len(v) == 2 {
+			if v[0] == nil {
+				if text, ok := v[1].(string); ok {
+					// Filter out metadata
+					if !strings.HasPrefix(text, "v1_") && text != "model" && len(text) > 0 {
+						*chunks = append(*chunks, text)
+					}
+					return // Don't recurse into this array
+				}
+			}
 		}
-	case string:
-		if len(v) >= 2 {
-			*texts = append(*texts, v)
+
+		// Recurse into all elements
+		for _, item := range v {
+			findTextChunks(item, chunks)
 		}
 	}
 }
