@@ -1,4 +1,4 @@
-package types
+package openai
 
 // ChatCompletionMessage represents a single message in the chat.
 type ChatCompletionMessage struct {
