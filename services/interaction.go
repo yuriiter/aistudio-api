@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -225,41 +226,71 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 		fmt.Println(">> Network capture confirmed started")
 	}
 
+	// Start monitoring accumulator DURING generation
+	fmt.Println(">> Monitoring capture during generation...")
+	lastSize := 0
+	accumulatorChan := make(chan int, 1)
+	stopMonitoring := make(chan bool, 1)
+
+	// Monitor in background
+	go func() {
+		for {
+			select {
+			case <-stopMonitoring:
+				return
+			default:
+				val, _ := page.Evaluate("window._AI_ACCUMULATOR")
+				if text, ok := val.(string); ok {
+					size := len(text)
+					if size != lastSize {
+						accumulatorChan <- size
+						lastSize = size
+					}
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+	}()
+
 	// Wait for UI to become IDLE (generation finished)
-	fmt.Println(">> Generating... Waiting for completion (Button restore)...")
+	fmt.Println(">> Waiting for generation to complete...")
 	err = runBtn.WaitFor(playwright.LocatorWaitForOptions{
 		State:   playwright.WaitForSelectorStateVisible,
 		Timeout: playwright.Float(120000), // Wait up to 2 mins
 	})
 	if err != nil {
+		stopMonitoring <- true
 		return "", fmt.Errorf("timeout waiting for AI to finish")
 	}
 
-	// Wait for the capture to complete
-	fmt.Println(">> UI says done. Waiting for network capture to complete...")
+	fmt.Println(">> UI complete, capturing final chunks...")
 
-	// Wait for capture done flag or timeout (longer timeout for slower models)
-	captureComplete := false
-	for i := 0; i < 60; i++ { // 60 * 200ms = 12 seconds max
-		done, err := page.Evaluate("window._AI_CAPTURE_DONE")
-		if err == nil {
-			if isDone, ok := done.(bool); ok && isDone {
-				captureComplete = true
-				fmt.Println(">> Network capture confirmed complete")
-				break
+	// Continue monitoring for a bit longer after UI completes
+	finalWait := time.After(5 * time.Second)
+	lastUpdate := time.Now()
+
+	for {
+		select {
+		case size := <-accumulatorChan:
+			fmt.Printf(">> Captured: %d bytes\n", size)
+			lastUpdate = time.Now()
+		case <-finalWait:
+			stopMonitoring <- true
+			goto done
+		default:
+			// If no updates for 3 seconds after UI complete, we're done
+			if time.Since(lastUpdate) > 3*time.Second {
+				stopMonitoring <- true
+				goto done
 			}
+			time.Sleep(100 * time.Millisecond)
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
 
-	if !captureComplete {
-		fmt.Println(">> WARNING: Capture done flag not set, reading anyway...")
-	}
+done:
+	fmt.Println(">> Capture monitoring stopped")
 
-	// Give extra time for data to stabilize
-	time.Sleep(1 * time.Second)
-
-	// Read captured data
+	// Read final captured data
 	val, err := page.Evaluate("window._AI_ACCUMULATOR")
 	if err != nil {
 		return "", fmt.Errorf("failed to read spy data: %v", err)
@@ -267,29 +298,29 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 
 	rawText, ok := val.(string)
 	if !ok || rawText == "" {
-		// Debug info
-		started, _ := page.Evaluate("window._AI_CAPTURE_STARTED")
-		done, _ := page.Evaluate("window._AI_CAPTURE_DONE")
-		fmt.Printf(">> DEBUG: Capture started=%v, done=%v\n", started, done)
-
 		return "", fmt.Errorf("captured network data was empty (length: 0)")
 	}
 
-	fmt.Printf(">> Successfully captured %d bytes from network\n", len(rawText))
+	fmt.Printf(">> Final capture: %d bytes\n", len(rawText))
 
-	// Validate that we have complete JSON (ends with ])
+	// Check if JSON looks complete
 	trimmed := strings.TrimSpace(rawText)
 	if !strings.HasSuffix(trimmed, "]") && !strings.HasSuffix(trimmed, "}") {
-		fmt.Printf(">> WARNING: Response may be incomplete (doesn't end with ] or })\n")
-		fmt.Printf(">> Last 50 chars: ...%s\n", trimmed[len(trimmed)-50:])
-		return "", fmt.Errorf("incomplete JSON response (ends with: %s)", trimmed[len(trimmed)-20:])
+		fmt.Printf(">> WARNING: Response may be incomplete\n")
+		fmt.Printf(">> Last 100 chars: ...%s\n", trimmed[max(0, len(trimmed)-100):])
+		// Don't fail, just try to parse what we have
 	}
 
 	// Optional: Print preview for debugging
-	if len(rawText) > 0 && len(rawText) < 500 {
-		fmt.Printf(">> Preview: %s\n", rawText)
-	} else if len(rawText) >= 500 {
-		fmt.Printf(">> Preview (first 300 chars): %s...\n", rawText[:300])
+	if len(rawText) < 500 {
+		fmt.Printf(">> Full response:\n%s\n", rawText)
+	} else {
+		fmt.Printf(">> Preview (first 200 chars): %s...\n", rawText[:200])
+		fmt.Printf(">> Preview (last 200 chars): ...%s\n", rawText[len(rawText)-200:])
+
+		// Also save to file for inspection
+		os.WriteFile("/tmp/google_response.txt", []byte(rawText), 0644)
+		fmt.Println(">> Full response saved to /tmp/google_response.txt")
 	}
 
 	return parseGoogleRPCResponse([]byte(rawText))
@@ -305,33 +336,82 @@ func buildPromptFromMessages(msgs []openai.ChatCompletionMessage) string {
 	return sb.String()
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func parseGoogleRPCResponse(body []byte) (string, error) {
 	rawStr := string(body)
 
-	// 1. Strip Google's Anti-Hijack Prefix if present
-	if idx := strings.Index(rawStr, "["); idx != -1 {
-		rawStr = rawStr[idx:]
-	} else {
-		return "", fmt.Errorf("invalid JSON structure - no array found")
-	}
+	fmt.Printf(">> Parser: received %d bytes\n", len(rawStr))
 
-	// 2. Unmarshal
+	// The response might be incomplete, try to parse what we can
+	// First, try to parse as-is
 	var raw []interface{}
-	if err := json.Unmarshal([]byte(rawStr), &raw); err != nil {
-		return "", fmt.Errorf("json parse error: %v (Length: %d)", err, len(rawStr))
+	err := json.Unmarshal([]byte(rawStr), &raw)
+
+	if err != nil {
+		fmt.Printf(">> Parser: direct parse failed: %v\n", err)
+
+		// Try to fix incomplete JSON by adding closing brackets
+		// Count opening vs closing brackets
+		openCount := strings.Count(rawStr, "[")
+		closeCount := strings.Count(rawStr, "]")
+
+		if openCount > closeCount {
+			missing := openCount - closeCount
+			fmt.Printf(">> Parser: missing %d closing brackets, attempting fix\n", missing)
+			fixedStr := rawStr + strings.Repeat("]", missing)
+
+			err = json.Unmarshal([]byte(fixedStr), &raw)
+			if err != nil {
+				fmt.Printf(">> Parser: fix attempt failed: %v\n", err)
+				return "", fmt.Errorf("could not parse response: %v", err)
+			}
+			fmt.Println(">> Parser: successfully parsed after adding closing brackets")
+		} else {
+			return "", fmt.Errorf("could not parse response: %v", err)
+		}
+	} else {
+		fmt.Println(">> Parser: parsed successfully on first try")
 	}
 
-	// 3. Find all [null, "text"] pairs and concatenate
+	// Extract all text chunks
 	var textChunks []string
 	findTextChunks(raw, &textChunks)
+
+	fmt.Printf(">> Parser: extracted %d text chunks\n", len(textChunks))
 
 	if len(textChunks) == 0 {
 		return "", fmt.Errorf("no text chunks found in response")
 	}
 
+	// Show first few chunks
+	for i, chunk := range textChunks {
+		if i < 3 {
+			preview := chunk
+			if len(preview) > 60 {
+				preview = preview[:60] + "..."
+			}
+			fmt.Printf(">> Parser: chunk %d: %q\n", i, preview)
+		}
+	}
+
 	// Concatenate all chunks
 	fullText := strings.Join(textChunks, "")
+	fmt.Printf(">> Parser: final result: %d chars\n", len(fullText))
+
 	return fullText, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // findTextChunks recursively finds all arrays of form [null, "text"] and collects the text
