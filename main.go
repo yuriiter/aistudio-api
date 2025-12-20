@@ -14,7 +14,6 @@ import (
 	"aistudio-api/services"
 
 	"github.com/gin-gonic/gin"
-	"github.com/playwright-community/playwright-go"
 )
 
 func main() {
@@ -29,7 +28,7 @@ func main() {
 
 	// Add routes
 	r.GET("/api/status", handleStatus)
-	r.POST("/api/generate", handleGenerate)
+	r.POST("/v1/chat/completions", HandleChatCompletions)
 
 	srv := &http.Server{
 		Addr:    ":8080",
@@ -65,9 +64,7 @@ func main() {
 	log.Println("Server exiting")
 }
 
-// Example Handlers
 func handleStatus(c *gin.Context) {
-	// A simple check to see if the browser is responsive
 	browser := services.Manager.Browser
 	if browser == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "Playwright Down"})
@@ -80,26 +77,4 @@ func handleStatus(c *gin.Context) {
 		"status":      "Running",
 		"browser_pid": pid,
 	})
-}
-
-func handleGenerate(c *gin.Context) {
-	// Get a new page for this specific request
-	page, err := services.Manager.CreateNewPage()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get browser page"})
-		return
-	}
-	// IMPORTANT: Defer page close to clean up after the request
-	defer page.Close()
-
-	// Example Playwright action:
-	_, err = page.Goto(services.NEW_PROMPT_PAGE, playwright.PageGotoOptions{
-		Timeout: playwright.Float(0),
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to navigate to prompt page"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Generation started", "url": page.URL()})
 }
