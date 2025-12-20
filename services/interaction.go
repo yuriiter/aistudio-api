@@ -3,7 +3,6 @@ package services
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -161,13 +160,13 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 	}
 	defer page.Close()
 
-	// Enable console logging from the page
-	page.OnConsole(func(msg playwright.ConsoleMessage) {
-		fmt.Printf(">> [Browser Console] %s: %s\n", msg.Type(), msg.Text())
-	})
+	// // Enable console logging from the page
+	// page.OnConsole(func(msg playwright.ConsoleMessage) {
+	// 	fmt.Printf(">> [Browser Console] %s: %s\n", msg.Type(), msg.Text())
+	// })
 
 	// Inject the spy script
-	fmt.Println(">> Injecting network spy (XHR + Fetch)...")
+	// fmt.Println(">> Injecting network spy (XHR + Fetch)...")
 	if err := page.AddInitScript(playwright.Script{Content: playwright.String(NETWORK_SPY_SCRIPT)}); err != nil {
 		return "", fmt.Errorf("spy inject failed: %v", err)
 	}
@@ -301,27 +300,27 @@ done:
 		return "", fmt.Errorf("captured network data was empty (length: 0)")
 	}
 
-	fmt.Printf(">> Final capture: %d bytes\n", len(rawText))
+	// fmt.Printf(">> Final capture: %d bytes\n", len(rawText))
 
 	// Check if JSON looks complete
 	trimmed := strings.TrimSpace(rawText)
 	if !strings.HasSuffix(trimmed, "]") && !strings.HasSuffix(trimmed, "}") {
-		fmt.Printf(">> WARNING: Response may be incomplete\n")
-		fmt.Printf(">> Last 100 chars: ...%s\n", trimmed[max(0, len(trimmed)-100):])
+		// fmt.Printf(">> WARNING: Response may be incomplete\n")
+		// fmt.Printf(">> Last 100 chars: ...%s\n", trimmed[max(0, len(trimmed)-100):])
 		// Don't fail, just try to parse what we have
 	}
 
 	// Optional: Print preview for debugging
-	if len(rawText) < 500 {
-		fmt.Printf(">> Full response:\n%s\n", rawText)
-	} else {
-		fmt.Printf(">> Preview (first 200 chars): %s...\n", rawText[:200])
-		fmt.Printf(">> Preview (last 200 chars): ...%s\n", rawText[len(rawText)-200:])
-
-		// Also save to file for inspection
-		os.WriteFile("/tmp/google_response.txt", []byte(rawText), 0644)
-		fmt.Println(">> Full response saved to /tmp/google_response.txt")
-	}
+	// if len(rawText) < 500 {
+	// 	fmt.Printf(">> Full response:\n%s\n", rawText)
+	// } else {
+	// 	fmt.Printf(">> Preview (first 200 chars): %s...\n", rawText[:200])
+	// 	fmt.Printf(">> Preview (last 200 chars): ...%s\n", rawText[len(rawText)-200:])
+	//
+	// 	// Also save to file for inspection
+	// 	os.WriteFile("/tmp/google_response.txt", []byte(rawText), 0644)
+	// 	fmt.Println(">> Full response saved to /tmp/google_response.txt")
+	// }
 
 	return parseGoogleRPCResponse([]byte(rawText))
 }
@@ -346,7 +345,7 @@ func max(a, b int) int {
 func parseGoogleRPCResponse(body []byte) (string, error) {
 	rawStr := string(body)
 
-	fmt.Printf(">> Parser: received %d bytes\n", len(rawStr))
+	// fmt.Printf(">> Parser: received %d bytes\n", len(rawStr))
 
 	// The response might be incomplete, try to parse what we can
 	// First, try to parse as-is
@@ -396,13 +395,13 @@ func parseGoogleRPCResponse(body []byte) (string, error) {
 			if len(preview) > 60 {
 				preview = preview[:60] + "..."
 			}
-			fmt.Printf(">> Parser: chunk %d: %q\n", i, preview)
+			// fmt.Printf(">> Parser: chunk %d: %q\n", i, preview)
 		}
 	}
 
 	// Concatenate all chunks
 	fullText := strings.Join(textChunks, "")
-	fmt.Printf(">> Parser: final result: %d chars\n", len(fullText))
+	// fmt.Printf(">> Parser: final result: %d chars\n", len(fullText))
 
 	return fullText, nil
 }
