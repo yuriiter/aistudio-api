@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,10 @@ import (
 // Selectors
 const (
 	SELECTOR_TEXTAREA = "textarea"
+	// Selectors for file upload
+	SELECTOR_ADD_MEDIA_BTN = "ms-add-media-button button"
+	SELECTOR_UPLOAD_TEXT   = "Upload files" // Exact text search as requested
+
 	// Idle = Ready to click (Generation finished)
 	SELECTOR_RUN_IDLE = "button[aria-label='Run'][type='submit']"
 	// Busy = Generating (Wait)
@@ -56,8 +61,6 @@ const NETWORK_SPY_SCRIPT = `
 			let captureTimeout = null;
 			
 			this.addEventListener('readystatechange', function() {
-				console.log('[Spy] ReadyState:', this.readyState, 'Status:', this.status);
-				
 				// State 3 = LOADING (streaming data)
 				if (this.readyState === 3) {
 					try {
@@ -65,7 +68,6 @@ const NETWORK_SPY_SCRIPT = `
 						if (currentText.length > lastLength) {
 							window._AI_ACCUMULATOR = currentText;
 							lastLength = currentText.length;
-							console.log('[Spy] Streaming... accumulated', lastLength, 'bytes');
 							
 							// Reset timeout - we're still getting data
 							if (captureTimeout) {
@@ -74,7 +76,6 @@ const NETWORK_SPY_SCRIPT = `
 							// Mark as done if no new data comes for 2 seconds
 							captureTimeout = setTimeout(() => {
 								if (window._AI_ACCUMULATOR.length > 0 && !window._AI_CAPTURE_DONE) {
-									console.log('[Spy] No new data for 2s, marking complete with', window._AI_ACCUMULATOR.length, 'bytes');
 									window._AI_CAPTURE_DONE = true;
 								}
 							}, 2000);
@@ -87,40 +88,19 @@ const NETWORK_SPY_SCRIPT = `
 				// State 4 = DONE
 				if (this.readyState === 4) {
 					if (captureTimeout) clearTimeout(captureTimeout);
-					console.log('[Spy] XHR Complete, status:', this.status);
-					console.log('[Spy] Response length:', this.responseText ? this.responseText.length : 0);
 					window._AI_ACCUMULATOR = this.responseText || "";
 					window._AI_CAPTURE_DONE = true;
-					console.log('[Spy] Captured', window._AI_ACCUMULATOR.length, 'bytes');
-				}
-				
-				// State 0 = UNSENT/ABORTED - if we have data, wait a bit then mark as done
-				if (this.readyState === 0 && window._AI_ACCUMULATOR.length > 0) {
-					if (captureTimeout) clearTimeout(captureTimeout);
-					console.log('[Spy] XHR aborted, we have', window._AI_ACCUMULATOR.length, 'bytes');
-					// Don't mark as done immediately - give it a moment
-					setTimeout(() => {
-						if (!window._AI_CAPTURE_DONE) {
-							console.log('[Spy] Finalizing after abort');
-							window._AI_CAPTURE_DONE = true;
-						}
-					}, 500);
 				}
 			});
 			
-			// Also try using onload as backup
 			this.addEventListener('load', function() {
-				console.log('[Spy] XHR Load event fired');
 				if (!window._AI_CAPTURE_DONE) {
 					window._AI_ACCUMULATOR = this.responseText || "";
 					window._AI_CAPTURE_DONE = true;
-					console.log('[Spy] Captured via load event:', window._AI_ACCUMULATOR.length, 'bytes');
 				}
 			});
 			
-			// Handle errors
 			this.addEventListener('error', function() {
-				console.log('[Spy] XHR Error event');
 				window._AI_CAPTURE_DONE = true;
 			});
 		}
@@ -134,7 +114,6 @@ const NETWORK_SPY_SCRIPT = `
 		const url = args[0] instanceof Request ? args[0].url : args[0];
 
 		if (url && url.includes("GenerateContent")) {
-			console.log("[Spy] Intercepting Fetch GenerateContent");
 			window._AI_CAPTURE_STARTED = true;
 			window._AI_ACCUMULATOR = ""; 
 			window._AI_CAPTURE_DONE = false;
@@ -144,29 +123,21 @@ const NETWORK_SPY_SCRIPT = `
 			
 			window._AI_ACCUMULATOR = text;
 			window._AI_CAPTURE_DONE = true;
-			console.log('[Spy] Captured', text.length, 'bytes via fetch');
 		}
 		return response;
 	};
-	
-	console.log("[Spy] Network interceptors installed (XHR + Fetch)");
 })();
 `
 
 func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
+	// Create a new page (thread-safe from Manager)
 	page, err := Manager.CreateNewPage()
 	if err != nil {
 		return "", err
 	}
 	defer page.Close()
 
-	// // Enable console logging from the page
-	// page.OnConsole(func(msg playwright.ConsoleMessage) {
-	// 	fmt.Printf(">> [Browser Console] %s: %s\n", msg.Type(), msg.Text())
-	// })
-
 	// Inject the spy script
-	// fmt.Println(">> Injecting network spy (XHR + Fetch)...")
 	if err := page.AddInitScript(playwright.Script{Content: playwright.String(NETWORK_SPY_SCRIPT)}); err != nil {
 		return "", fmt.Errorf("spy inject failed: %v", err)
 	}
@@ -180,17 +151,55 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 		return "", err
 	}
 
-	// Input
-	fmt.Println(">> Waiting for input...")
-	inputLocator := page.Locator(SELECTOR_TEXTAREA).First()
-	if err := inputLocator.WaitFor(); err != nil {
-		return "", fmt.Errorf("input not found")
+	// ---------------------------------------------------------
+	// New Input Method: Upload .txt file instead of typing
+	// ---------------------------------------------------------
+	fmt.Println(">> Preparing file upload...")
+
+	// 1. Create a temporary .txt file with the prompt content
+	fullPrompt := buildPromptFromMessages(req.Messages)
+	tmpFile, err := os.CreateTemp("", "aistudio-prompt-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	if _, err := tmpFile.WriteString(fullPrompt); err != nil {
+		return "", fmt.Errorf("failed to write to temp file: %v", err)
+	}
+	tmpFilePath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpFilePath) // Cleanup temp file
+
+	// 2. Locate the "Add Media" button
+	addMediaBtn := page.Locator(SELECTOR_ADD_MEDIA_BTN).First()
+	if err := addMediaBtn.WaitFor(); err != nil {
+		return "", fmt.Errorf("add media button not found")
 	}
 
-	fullPrompt := buildPromptFromMessages(req.Messages)
-	if err := inputLocator.Fill(fullPrompt); err != nil {
-		return "", err
+	// 3. Handle File Chooser
+	// We expect a file chooser to open after we click the button and then select "UploadFiles"
+	fmt.Println(">> Triggering file chooser...")
+	fileChooser, err := page.ExpectFileChooser(func() error {
+		// Open the menu
+		if err := addMediaBtn.Click(); err != nil {
+			return err
+		}
+		// Click the specific text in the menu to trigger system dialog
+		// Using GetByText as requested
+		return page.GetByText(SELECTOR_UPLOAD_TEXT).Click()
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to open file chooser: %v", err)
 	}
+
+	// 4. Set the file
+	if err := fileChooser.SetFiles([]string{tmpFilePath}); err != nil {
+		return "", fmt.Errorf("failed to set input files: %v", err)
+	}
+	fmt.Println(">> File attached.")
+
+	// ---------------------------------------------------------
+	// Execution
+	// ---------------------------------------------------------
 
 	// Click Run (IDLE state)
 	fmt.Println(">> Clicking Run...")
@@ -199,8 +208,12 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 		return "", fmt.Errorf("run button not found")
 	}
 
+	// Small delay to ensure file processing in UI is registered before clicking Run
+	time.Sleep(1 * time.Second)
+
 	if err := runBtn.Click(); err != nil {
-		inputLocator.Press("Control+Enter")
+		// Fallback if click fails
+		page.Locator(SELECTOR_TEXTAREA).Press("Control+Enter")
 	}
 
 	// Wait for UI to become BUSY (generation started)
@@ -216,14 +229,6 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 
 	// Give capture a moment to start
 	time.Sleep(500 * time.Millisecond)
-
-	// Verify capture started
-	started, _ := page.Evaluate("window._AI_CAPTURE_STARTED")
-	if isStarted, ok := started.(bool); !ok || !isStarted {
-		fmt.Println(">> WARNING: Capture may not have started")
-	} else {
-		fmt.Println(">> Network capture confirmed started")
-	}
 
 	// Start monitoring accumulator DURING generation
 	fmt.Println(">> Monitoring capture during generation...")
@@ -300,28 +305,6 @@ done:
 		return "", fmt.Errorf("captured network data was empty (length: 0)")
 	}
 
-	// fmt.Printf(">> Final capture: %d bytes\n", len(rawText))
-
-	// Check if JSON looks complete
-	trimmed := strings.TrimSpace(rawText)
-	if !strings.HasSuffix(trimmed, "]") && !strings.HasSuffix(trimmed, "}") {
-		// fmt.Printf(">> WARNING: Response may be incomplete\n")
-		// fmt.Printf(">> Last 100 chars: ...%s\n", trimmed[max(0, len(trimmed)-100):])
-		// Don't fail, just try to parse what we have
-	}
-
-	// Optional: Print preview for debugging
-	// if len(rawText) < 500 {
-	// 	fmt.Printf(">> Full response:\n%s\n", rawText)
-	// } else {
-	// 	fmt.Printf(">> Preview (first 200 chars): %s...\n", rawText[:200])
-	// 	fmt.Printf(">> Preview (last 200 chars): ...%s\n", rawText[len(rawText)-200:])
-	//
-	// 	// Also save to file for inspection
-	// 	os.WriteFile("/tmp/google_response.txt", []byte(rawText), 0644)
-	// 	fmt.Println(">> Full response saved to /tmp/google_response.txt")
-	// }
-
 	return parseGoogleRPCResponse([]byte(rawText))
 }
 
@@ -344,65 +327,37 @@ func max(a, b int) int {
 
 func parseGoogleRPCResponse(body []byte) (string, error) {
 	rawStr := string(body)
-
-	// fmt.Printf(">> Parser: received %d bytes\n", len(rawStr))
-
-	// The response might be incomplete, try to parse what we can
-	// First, try to parse as-is
 	var raw []interface{}
 	err := json.Unmarshal([]byte(rawStr), &raw)
 
 	if err != nil {
-		fmt.Printf(">> Parser: direct parse failed: %v\n", err)
-
 		// Try to fix incomplete JSON by adding closing brackets
-		// Count opening vs closing brackets
 		openCount := strings.Count(rawStr, "[")
 		closeCount := strings.Count(rawStr, "]")
 
 		if openCount > closeCount {
 			missing := openCount - closeCount
-			fmt.Printf(">> Parser: missing %d closing brackets, attempting fix\n", missing)
 			fixedStr := rawStr + strings.Repeat("]", missing)
 
 			err = json.Unmarshal([]byte(fixedStr), &raw)
 			if err != nil {
-				fmt.Printf(">> Parser: fix attempt failed: %v\n", err)
 				return "", fmt.Errorf("could not parse response: %v", err)
 			}
-			fmt.Println(">> Parser: successfully parsed after adding closing brackets")
 		} else {
 			return "", fmt.Errorf("could not parse response: %v", err)
 		}
-	} else {
-		fmt.Println(">> Parser: parsed successfully on first try")
 	}
 
 	// Extract all text chunks
 	var textChunks []string
 	findTextChunks(raw, &textChunks)
 
-	fmt.Printf(">> Parser: extracted %d text chunks\n", len(textChunks))
-
 	if len(textChunks) == 0 {
 		return "", fmt.Errorf("no text chunks found in response")
 	}
 
-	// Show first few chunks
-	for i, chunk := range textChunks {
-		if i < 3 {
-			preview := chunk
-			if len(preview) > 60 {
-				preview = preview[:60] + "..."
-			}
-			// fmt.Printf(">> Parser: chunk %d: %q\n", i, preview)
-		}
-	}
-
 	// Concatenate all chunks
 	fullText := strings.Join(textChunks, "")
-	// fmt.Printf(">> Parser: final result: %d chars\n", len(fullText))
-
 	return fullText, nil
 }
 
@@ -429,7 +384,6 @@ func findTextChunks(data interface{}, chunks *[]string) {
 				}
 			}
 		}
-
 		// Recurse into all elements
 		for _, item := range v {
 			findTextChunks(item, chunks)

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/playwright-community/playwright-go"
@@ -26,6 +27,7 @@ type PlaywrightManager struct {
 	ChromeCmd *exec.Cmd
 	Browser   playwright.Browser
 	Context   playwright.BrowserContext
+	mu        sync.Mutex // Mutex to ensure thread-safe page creation
 }
 
 var Manager *PlaywrightManager
@@ -272,7 +274,11 @@ func (pm *PlaywrightManager) Cleanup() {
 }
 
 // CreateNewPage is a utility for API handlers to get a fresh page
+// It uses a Mutex to ensure thread safety when processing concurrent requests
 func (pm *PlaywrightManager) CreateNewPage() (playwright.Page, error) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
 	if pm.Context == nil {
 		return nil, fmt.Errorf("playwright context is not initialized")
 	}
