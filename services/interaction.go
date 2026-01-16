@@ -25,6 +25,12 @@ const (
 	SELECTOR_RUN_BUSY = "button[aria-label='Run'][type='button']"
 )
 
+// Configuration
+const (
+	MAX_RETRIES = 3
+	RETRY_DELAY = 2 * time.Second
+)
+
 // ResponseCapture holds the captured network response
 type ResponseCapture struct {
 	mu       sync.Mutex
@@ -35,7 +41,6 @@ type ResponseCapture struct {
 // Advanced JavaScript spy that handles the response directly
 const NETWORK_SPY_SCRIPT = `
 (() => {
-	// Intercept XMLHttpRequest
 	const originalXHROpen = XMLHttpRequest.prototype.open;
 	const originalXHRSend = XMLHttpRequest.prototype.send;
 	
@@ -50,42 +55,30 @@ const NETWORK_SPY_SCRIPT = `
 
 	XMLHttpRequest.prototype.send = function(...args) {
 		if (this._url && this._url.includes('GenerateContent')) {
-			console.log('[Spy] Intercepting XHR GenerateContent');
 			window._AI_CAPTURE_STARTED = true;
 			window._AI_ACCUMULATOR = "";
 			window._AI_CAPTURE_DONE = false;
 
-			// Attach listener BEFORE send
 			const xhr = this;
 			let lastLength = 0;
 			let captureTimeout = null;
 			
 			this.addEventListener('readystatechange', function() {
-				// State 3 = LOADING (streaming data)
 				if (this.readyState === 3) {
 					try {
 						const currentText = this.responseText || "";
 						if (currentText.length > lastLength) {
 							window._AI_ACCUMULATOR = currentText;
 							lastLength = currentText.length;
-							
-							// Reset timeout - we're still getting data
-							if (captureTimeout) {
-								clearTimeout(captureTimeout);
-							}
-							// Mark as done if no new data comes for 2 seconds
+							if (captureTimeout) clearTimeout(captureTimeout);
 							captureTimeout = setTimeout(() => {
 								if (window._AI_ACCUMULATOR.length > 0 && !window._AI_CAPTURE_DONE) {
 									window._AI_CAPTURE_DONE = true;
 								}
 							}, 2000);
 						}
-					} catch (e) {
-						console.log('[Spy] Error reading responseText in state 3:', e);
-					}
+					} catch (e) {}
 				}
-				
-				// State 4 = DONE
 				if (this.readyState === 4) {
 					if (captureTimeout) clearTimeout(captureTimeout);
 					window._AI_ACCUMULATOR = this.responseText || "";
@@ -100,27 +93,21 @@ const NETWORK_SPY_SCRIPT = `
 				}
 			});
 			
-			this.addEventListener('error', function() {
-				window._AI_CAPTURE_DONE = true;
-			});
+			this.addEventListener('error', function() { window._AI_CAPTURE_DONE = true; });
 		}
 		return originalXHRSend.apply(this, args);
 	};
 
-	// Also intercept fetch as backup
 	const originalFetch = window.fetch;
 	window.fetch = async (...args) => {
 		const response = await originalFetch(...args);
 		const url = args[0] instanceof Request ? args[0].url : args[0];
-
 		if (url && url.includes("GenerateContent")) {
 			window._AI_CAPTURE_STARTED = true;
 			window._AI_ACCUMULATOR = ""; 
 			window._AI_CAPTURE_DONE = false;
-			
 			const clone = response.clone();
 			const text = await clone.text();
-			
 			window._AI_ACCUMULATOR = text;
 			window._AI_CAPTURE_DONE = true;
 		}
@@ -129,7 +116,31 @@ const NETWORK_SPY_SCRIPT = `
 })();
 `
 
+// ExecuteChatInteraction is the public wrapper that handles retries
 func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
+	var lastErr error
+
+	for i := 0; i < MAX_RETRIES; i++ {
+		if i > 0 {
+			fmt.Printf(">> [Retry] Attempt %d/%d starting in %v...\n", i+1, MAX_RETRIES, RETRY_DELAY)
+			time.Sleep(RETRY_DELAY)
+		}
+
+		fmt.Printf(">> [Attempt %d] Starting interaction...\n", i+1)
+		response, err := executeAttempt(req)
+		if err == nil {
+			return response, nil
+		}
+
+		fmt.Printf(">> [Attempt %d] Failed: %v\n", i+1, err)
+		lastErr = err
+	}
+
+	return "", fmt.Errorf("failed after %d attempts. Last error: %v", MAX_RETRIES, lastErr)
+}
+
+// executeAttempt contains the actual Playwright logic
+func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 	// Create a new page (thread-safe from Manager)
 	page, err := Manager.CreateNewPage()
 	if err != nil {
@@ -152,11 +163,11 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 	}
 
 	// ---------------------------------------------------------
-	// New Input Method: Upload .txt file instead of typing
+	// File Upload Logic
 	// ---------------------------------------------------------
 	fmt.Println(">> Preparing file upload...")
 
-	// 1. Create a temporary .txt file with the prompt content
+	// 1. Create temporary .txt file
 	fullPrompt := buildPromptFromMessages(req.Messages)
 	tmpFile, err := os.CreateTemp("", "aistudio-prompt-*.txt")
 	if err != nil {
@@ -167,7 +178,7 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 	}
 	tmpFilePath := tmpFile.Name()
 	tmpFile.Close()
-	defer os.Remove(tmpFilePath) // Cleanup temp file
+	defer os.Remove(tmpFilePath)
 
 	// 2. Locate the "Add Media" button
 	addMediaBtn := page.Locator(SELECTOR_ADD_MEDIA_BTN).First()
@@ -175,23 +186,36 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 		return "", fmt.Errorf("add media button not found")
 	}
 
-	// 3. Handle File Chooser
-	// We expect a file chooser to open after we click the button and then select "UploadFiles"
-	fmt.Println(">> Triggering file chooser...")
-	fileChooser, err := page.ExpectFileChooser(func() error {
-		// Open the menu
-		if err := addMediaBtn.Click(); err != nil {
-			return err
-		}
-		// Click the specific text in the menu to trigger system dialog
-		// Using GetByText as requested
-		return page.GetByText(SELECTOR_UPLOAD_TEXT).Click()
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to open file chooser: %v", err)
+	// 3. Open the Media Menu explicitly
+	fmt.Println(">> Opening Media Menu...")
+	if err := addMediaBtn.Click(); err != nil {
+		return "", fmt.Errorf("failed to click add media button: %v", err)
 	}
 
-	// 4. Set the file
+	// 4. Locate the "UploadFiles" button in the dropdown
+	uploadBtn := page.GetByText(SELECTOR_UPLOAD_TEXT).First()
+
+	// Wait for the dropdown to render and the text to be visible
+	if err := uploadBtn.WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(5000),
+	}); err != nil {
+		return "", fmt.Errorf("dropdown opened, but text '%s' was not found/visible", SELECTOR_UPLOAD_TEXT)
+	}
+
+	// Tiny sleep to ensure the element is interactive
+	time.Sleep(300 * time.Millisecond)
+
+	// 5. Trigger File Chooser
+	fmt.Println(">> Triggering file chooser...")
+	fileChooser, err := page.ExpectFileChooser(func() error {
+		return uploadBtn.Click()
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to catch file chooser event: %v", err)
+	}
+
+	// 6. Set the file
 	if err := fileChooser.SetFiles([]string{tmpFilePath}); err != nil {
 		return "", fmt.Errorf("failed to set input files: %v", err)
 	}
@@ -208,15 +232,15 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 		return "", fmt.Errorf("run button not found")
 	}
 
-	// Small delay to ensure file processing in UI is registered before clicking Run
+	// Small delay to ensure file attachment is processed by UI
 	time.Sleep(1 * time.Second)
 
 	if err := runBtn.Click(); err != nil {
-		// Fallback if click fails
+		// Fallback
 		page.Locator(SELECTOR_TEXTAREA).Press("Control+Enter")
 	}
 
-	// Wait for UI to become BUSY (generation started)
+	// Wait for UI to become BUSY
 	fmt.Println(">> Waiting for generation to START...")
 	busyBtn := page.Locator(SELECTOR_RUN_BUSY).First()
 	err = busyBtn.WaitFor(playwright.LocatorWaitForOptions{
@@ -230,13 +254,12 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 	// Give capture a moment to start
 	time.Sleep(500 * time.Millisecond)
 
-	// Start monitoring accumulator DURING generation
+	// Start monitoring accumulator
 	fmt.Println(">> Monitoring capture during generation...")
 	lastSize := 0
 	accumulatorChan := make(chan int, 1)
 	stopMonitoring := make(chan bool, 1)
 
-	// Monitor in background
 	go func() {
 		for {
 			select {
@@ -256,11 +279,11 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 		}
 	}()
 
-	// Wait for UI to become IDLE (generation finished)
+	// Wait for UI to become IDLE
 	fmt.Println(">> Waiting for generation to complete...")
 	err = runBtn.WaitFor(playwright.LocatorWaitForOptions{
 		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: playwright.Float(120000), // Wait up to 2 mins
+		Timeout: playwright.Float(180000), // 3 mins timeout
 	})
 	if err != nil {
 		stopMonitoring <- true
@@ -269,7 +292,6 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 
 	fmt.Println(">> UI complete, capturing final chunks...")
 
-	// Continue monitoring for a bit longer after UI completes
 	finalWait := time.After(5 * time.Second)
 	lastUpdate := time.Now()
 
@@ -282,7 +304,6 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 			stopMonitoring <- true
 			goto done
 		default:
-			// If no updates for 3 seconds after UI complete, we're done
 			if time.Since(lastUpdate) > 3*time.Second {
 				stopMonitoring <- true
 				goto done
@@ -294,7 +315,6 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 done:
 	fmt.Println(">> Capture monitoring stopped")
 
-	// Read final captured data
 	val, err := page.Evaluate("window._AI_ACCUMULATOR")
 	if err != nil {
 		return "", fmt.Errorf("failed to read spy data: %v", err)
@@ -302,7 +322,7 @@ done:
 
 	rawText, ok := val.(string)
 	if !ok || rawText == "" {
-		return "", fmt.Errorf("captured network data was empty (length: 0)")
+		return "", fmt.Errorf("captured network data was empty")
 	}
 
 	return parseGoogleRPCResponse([]byte(rawText))
@@ -318,37 +338,24 @@ func buildPromptFromMessages(msgs []openai.ChatCompletionMessage) string {
 	return sb.String()
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func parseGoogleRPCResponse(body []byte) (string, error) {
 	rawStr := string(body)
 	var raw []interface{}
 	err := json.Unmarshal([]byte(rawStr), &raw)
 
 	if err != nil {
-		// Try to fix incomplete JSON by adding closing brackets
 		openCount := strings.Count(rawStr, "[")
 		closeCount := strings.Count(rawStr, "]")
-
 		if openCount > closeCount {
 			missing := openCount - closeCount
 			fixedStr := rawStr + strings.Repeat("]", missing)
-
 			err = json.Unmarshal([]byte(fixedStr), &raw)
-			if err != nil {
-				return "", fmt.Errorf("could not parse response: %v", err)
-			}
-		} else {
+		}
+		if err != nil {
 			return "", fmt.Errorf("could not parse response: %v", err)
 		}
 	}
 
-	// Extract all text chunks
 	var textChunks []string
 	findTextChunks(raw, &textChunks)
 
@@ -356,35 +363,22 @@ func parseGoogleRPCResponse(body []byte) (string, error) {
 		return "", fmt.Errorf("no text chunks found in response")
 	}
 
-	// Concatenate all chunks
-	fullText := strings.Join(textChunks, "")
-	return fullText, nil
+	return strings.Join(textChunks, ""), nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// findTextChunks recursively finds all arrays of form [null, "text"] and collects the text
 func findTextChunks(data interface{}, chunks *[]string) {
 	switch v := data.(type) {
 	case []interface{}:
-		// Check if this is a [null, string] pair
 		if len(v) == 2 {
 			if v[0] == nil {
 				if text, ok := v[1].(string); ok {
-					// Filter out metadata
 					if !strings.HasPrefix(text, "v1_") && text != "model" && len(text) > 0 {
 						*chunks = append(*chunks, text)
 					}
-					return // Don't recurse into this array
+					return
 				}
 			}
 		}
-		// Recurse into all elements
 		for _, item := range v {
 			findTextChunks(item, chunks)
 		}
