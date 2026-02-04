@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"fmt"
+	"log" // Added for timestamped logging
 	"os"
 	"strings"
 	"sync"
@@ -14,160 +15,112 @@ import (
 
 // Selectors
 const (
-	SELECTOR_TEXTAREA = "textarea"
-	// Selectors for file upload
+	SELECTOR_TEXTAREA      = "textarea"
 	SELECTOR_ADD_MEDIA_BTN = "ms-add-media-button button"
-	SELECTOR_UPLOAD_TEXT   = "Upload files" // Exact text search as requested
+	SELECTOR_UPLOAD_TEXT   = "Upload files"
 
-	// Idle = Ready to click (Generation finished)
-	SELECTOR_RUN_IDLE = "button[aria-label='Run'][type='submit']"
-	// Busy = Generating (Wait)
-	SELECTOR_RUN_BUSY = "button[aria-label='Run'][type='button']"
+	// Idle = Ready to click (Type="submit")
+	SELECTOR_RUN_IDLE = "ms-run-button button[type='submit']"
+	// Busy = Generating (Type="button")
+	SELECTOR_RUN_BUSY = "ms-run-button button[type='button']"
 )
 
 // Configuration
 const (
 	MAX_RETRIES = 3
 	RETRY_DELAY = 2 * time.Second
+
+	// Increased for safety
+	PARSE_ATTEMPTS = 5
+	PARSE_INTERVAL = 200 * time.Millisecond
 )
 
-// ResponseCapture holds the captured network response
-type ResponseCapture struct {
-	mu       sync.Mutex
-	chunks   []string
-	complete bool
-}
-
-// Advanced JavaScript spy that handles the response directly
-const NETWORK_SPY_SCRIPT = `
-(() => {
-	const originalXHROpen = XMLHttpRequest.prototype.open;
-	const originalXHRSend = XMLHttpRequest.prototype.send;
-	
-	window._AI_ACCUMULATOR = ""; 
-	window._AI_CAPTURE_DONE = false;
-	window._AI_CAPTURE_STARTED = false;
-
-	XMLHttpRequest.prototype.open = function(method, url, ...args) {
-		this._url = url;
-		return originalXHROpen.call(this, method, url, ...args);
-	};
-
-	XMLHttpRequest.prototype.send = function(...args) {
-		if (this._url && this._url.includes('GenerateContent')) {
-			window._AI_CAPTURE_STARTED = true;
-			window._AI_ACCUMULATOR = "";
-			window._AI_CAPTURE_DONE = false;
-
-			const xhr = this;
-			let lastLength = 0;
-			let captureTimeout = null;
-			
-			this.addEventListener('readystatechange', function() {
-				if (this.readyState === 3) {
-					try {
-						const currentText = this.responseText || "";
-						if (currentText.length > lastLength) {
-							window._AI_ACCUMULATOR = currentText;
-							lastLength = currentText.length;
-							if (captureTimeout) clearTimeout(captureTimeout);
-							captureTimeout = setTimeout(() => {
-								if (window._AI_ACCUMULATOR.length > 0 && !window._AI_CAPTURE_DONE) {
-									window._AI_CAPTURE_DONE = true;
-								}
-							}, 2000);
-						}
-					} catch (e) {}
-				}
-				if (this.readyState === 4) {
-					if (captureTimeout) clearTimeout(captureTimeout);
-					window._AI_ACCUMULATOR = this.responseText || "";
-					window._AI_CAPTURE_DONE = true;
-				}
-			});
-			
-			this.addEventListener('load', function() {
-				if (!window._AI_CAPTURE_DONE) {
-					window._AI_ACCUMULATOR = this.responseText || "";
-					window._AI_CAPTURE_DONE = true;
-				}
-			});
-			
-			this.addEventListener('error', function() { window._AI_CAPTURE_DONE = true; });
-		}
-		return originalXHRSend.apply(this, args);
-	};
-
-	const originalFetch = window.fetch;
-	window.fetch = async (...args) => {
-		const response = await originalFetch(...args);
-		const url = args[0] instanceof Request ? args[0].url : args[0];
-		if (url && url.includes("GenerateContent")) {
-			window._AI_CAPTURE_STARTED = true;
-			window._AI_ACCUMULATOR = ""; 
-			window._AI_CAPTURE_DONE = false;
-			const clone = response.clone();
-			const text = await clone.text();
-			window._AI_ACCUMULATOR = text;
-			window._AI_CAPTURE_DONE = true;
-		}
-		return response;
-	};
-})();
-`
-
-// ExecuteChatInteraction is the public wrapper that handles retries
+// ExecuteChatInteraction handles the full retry loop
 func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 	var lastErr error
 
 	for i := 0; i < MAX_RETRIES; i++ {
 		if i > 0 {
-			fmt.Printf(">> [Retry] Attempt %d/%d starting in %v...\n", i+1, MAX_RETRIES, RETRY_DELAY)
+			log.Printf(">> [Retry] Attempt %d/%d starting in %v...\n", i+1, MAX_RETRIES, RETRY_DELAY)
 			time.Sleep(RETRY_DELAY)
 		}
 
-		fmt.Printf(">> [Attempt %d] Starting interaction...\n", i+1)
+		log.Printf(">> [Attempt %d] Starting interaction...\n", i+1)
 		response, err := executeAttempt(req)
 		if err == nil {
 			return response, nil
 		}
 
-		fmt.Printf(">> [Attempt %d] Failed: %v\n", i+1, err)
+		log.Printf(">> [Attempt %d] Failed: %v\n", i+1, err)
 		lastErr = err
 	}
 
 	return "", fmt.Errorf("failed after %d attempts. Last error: %v", MAX_RETRIES, lastErr)
 }
 
-// executeAttempt contains the actual Playwright logic
+// executeAttempt contains the Playwright logic
 func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
-	// Create a new page (thread-safe from Manager)
 	page, err := Manager.CreateNewPage()
 	if err != nil {
 		return "", err
 	}
 	defer page.Close()
 
-	// Inject the spy script
-	if err := page.AddInitScript(playwright.Script{Content: playwright.String(NETWORK_SPY_SCRIPT)}); err != nil {
-		return "", fmt.Errorf("spy inject failed: %v", err)
-	}
+	// ---------------------------------------------------------
+	// 1. Setup Network Listener with Signal Channel
+	// ---------------------------------------------------------
+	var capturedBodies [][]byte
+	var captureMu sync.Mutex
 
-	// Navigate
+	// Channel to signal that a generation request has finished downloading
+	networkFinishedChan := make(chan bool, 1)
+
+	page.OnResponse(func(response playwright.Response) {
+		if strings.Contains(response.URL(), "GenerateContent") {
+			log.Println(">> [Net] Detected 'GenerateContent' stream...")
+
+			// Processing body in a goroutine to ensure we don't block the event loop,
+			// though Body() itself blocks until stream close.
+			go func() {
+				// This waits until the server closes the stream
+				body, err := response.Body()
+				if err != nil {
+					log.Printf("!! [Net] Error reading body: %v\n", err)
+					return
+				}
+
+				log.Printf(">> [Net] Stream closed. Captured %d bytes.\n", len(body))
+
+				captureMu.Lock()
+				capturedBodies = append(capturedBodies, body)
+				captureMu.Unlock()
+
+				// Signal that we have data
+				select {
+				case networkFinishedChan <- true:
+				default:
+				}
+			}()
+		}
+	})
+
+	// ---------------------------------------------------------
+	// 2. Navigation
+	// ---------------------------------------------------------
 	targetURL := NEW_PROMPT_PAGE
 	if req.Model != "" {
 		targetURL = fmt.Sprintf("%s?model=%s", NEW_PROMPT_PAGE, req.Model)
 	}
-	if _, err := page.Goto(targetURL); err != nil {
-		return "", err
+
+	log.Println(">> Navigating to AI Studio...")
+	if _, err := page.Goto(targetURL, playwright.PageGotoOptions{Timeout: playwright.Float(30000)}); err != nil {
+		return "", fmt.Errorf("navigation failed: %v", err)
 	}
 
 	// ---------------------------------------------------------
-	// File Upload Logic
+	// 3. File Upload
 	// ---------------------------------------------------------
-	fmt.Println(">> Preparing file upload...")
-
-	// 1. Create temporary .txt file
+	log.Println(">> Preparing prompt file...")
 	fullPrompt := buildPromptFromMessages(req.Messages)
 	tmpFile, err := os.CreateTemp("", "aistudio-prompt-*.txt")
 	if err != nil {
@@ -180,152 +133,118 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 	tmpFile.Close()
 	defer os.Remove(tmpFilePath)
 
-	// 2. Locate the "Add Media" button
+	// Open Media Menu
 	addMediaBtn := page.Locator(SELECTOR_ADD_MEDIA_BTN).First()
 	if err := addMediaBtn.WaitFor(); err != nil {
 		return "", fmt.Errorf("add media button not found")
 	}
+	addMediaBtn.Click()
 
-	// 3. Open the Media Menu explicitly
-	fmt.Println(">> Opening Media Menu...")
-	if err := addMediaBtn.Click(); err != nil {
-		return "", fmt.Errorf("failed to click add media button: %v", err)
-	}
-
-	// 4. Locate the "UploadFiles" button in the dropdown
+	// Handle File Chooser
 	uploadBtn := page.GetByText(SELECTOR_UPLOAD_TEXT).First()
-
-	// Wait for the dropdown to render and the text to be visible
-	if err := uploadBtn.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: playwright.Float(5000),
-	}); err != nil {
-		return "", fmt.Errorf("dropdown opened, but text '%s' was not found/visible", SELECTOR_UPLOAD_TEXT)
+	if err := uploadBtn.WaitFor(playwright.LocatorWaitForOptions{State: playwright.WaitForSelectorStateVisible}); err != nil {
+		return "", fmt.Errorf("upload text not found")
 	}
+	// Small delay for animation stability
+	time.Sleep(500 * time.Millisecond)
 
-	// Tiny sleep to ensure the element is interactive
-	time.Sleep(300 * time.Millisecond)
-
-	// 5. Trigger File Chooser
-	fmt.Println(">> Triggering file chooser...")
 	fileChooser, err := page.ExpectFileChooser(func() error {
 		return uploadBtn.Click()
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to catch file chooser event: %v", err)
+		return "", fmt.Errorf("file chooser failed: %v", err)
 	}
-
-	// 6. Set the file
 	if err := fileChooser.SetFiles([]string{tmpFilePath}); err != nil {
-		return "", fmt.Errorf("failed to set input files: %v", err)
+		return "", fmt.Errorf("failed to set files: %v", err)
 	}
-	fmt.Println(">> File attached.")
+	log.Println(">> File attached.")
 
 	// ---------------------------------------------------------
-	// Execution
+	// 4. Run Execution
 	// ---------------------------------------------------------
-
-	// Click Run (IDLE state)
-	fmt.Println(">> Clicking Run...")
 	runBtn := page.Locator(SELECTOR_RUN_IDLE).First()
 	if err := runBtn.WaitFor(); err != nil {
 		return "", fmt.Errorf("run button not found")
 	}
 
-	// Small delay to ensure file attachment is processed by UI
-	time.Sleep(1 * time.Second)
+	time.Sleep(1 * time.Second) // Wait for attachment processing
 
+	log.Println(">> Clicking Run...")
 	if err := runBtn.Click(); err != nil {
 		// Fallback
 		page.Locator(SELECTOR_TEXTAREA).Press("Control+Enter")
 	}
 
-	// Wait for UI to become BUSY
-	fmt.Println(">> Waiting for generation to START...")
+	// ---------------------------------------------------------
+	// 5. Dual Wait Strategy (Network OR UI)
+	// ---------------------------------------------------------
+
+	// Step A: Wait for it to START (Busy button appears)
+	log.Println(">> Waiting for UI to switch to BUSY...")
 	busyBtn := page.Locator(SELECTOR_RUN_BUSY).First()
 	err = busyBtn.WaitFor(playwright.LocatorWaitForOptions{
 		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: playwright.Float(10000),
+		Timeout: playwright.Float(15000),
 	})
 	if err != nil {
-		return "", fmt.Errorf("UI failed to switch to 'generating' mode")
+		// If we missed the busy state but network finished, that's fine too.
+		// We check network below.
+		log.Printf("!! Warning: UI didn't show 'Stop' button (fast response?). Checking network...\n")
+	} else {
+		log.Println(">> UI is BUSY. Generation started.")
 	}
 
-	// Give capture a moment to start
-	time.Sleep(500 * time.Millisecond)
+	// Step B: Race - Wait for Network Finish OR UI Idle
+	log.Println(">> Waiting for completion (Network Stream OR UI Idle)...")
 
-	// Start monitoring accumulator
-	fmt.Println(">> Monitoring capture during generation...")
-	lastSize := 0
-	accumulatorChan := make(chan int, 1)
-	stopMonitoring := make(chan bool, 1)
-
+	uiIdleChan := make(chan error, 1)
 	go func() {
-		for {
-			select {
-			case <-stopMonitoring:
-				return
-			default:
-				val, _ := page.Evaluate("window._AI_ACCUMULATOR")
-				if text, ok := val.(string); ok {
-					size := len(text)
-					if size != lastSize {
-						accumulatorChan <- size
-						lastSize = size
-					}
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-		}
+		// Wait for the "Stop" button to disappear
+		err := busyBtn.WaitFor(playwright.LocatorWaitForOptions{
+			State:   playwright.WaitForSelectorStateHidden,
+			Timeout: playwright.Float(180000), // 3 min max
+		})
+		uiIdleChan <- err
 	}()
 
-	// Wait for UI to become IDLE
-	fmt.Println(">> Waiting for generation to complete...")
-	err = runBtn.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: playwright.Float(180000), // 3 mins timeout
-	})
-	if err != nil {
-		stopMonitoring <- true
-		return "", fmt.Errorf("timeout waiting for AI to finish")
-	}
-
-	fmt.Println(">> UI complete, capturing final chunks...")
-
-	finalWait := time.After(5 * time.Second)
-	lastUpdate := time.Now()
-
-	for {
-		select {
-		case size := <-accumulatorChan:
-			fmt.Printf(">> Captured: %d bytes\n", size)
-			lastUpdate = time.Now()
-		case <-finalWait:
-			stopMonitoring <- true
-			goto done
-		default:
-			if time.Since(lastUpdate) > 3*time.Second {
-				stopMonitoring <- true
-				goto done
-			}
-			time.Sleep(100 * time.Millisecond)
+	select {
+	case <-networkFinishedChan:
+		log.Println(">> [Event] Network stream finished! (Bypassing UI wait)")
+	case err := <-uiIdleChan:
+		if err != nil {
+			log.Printf("!! [Event] UI Wait timed out: %v\n", err)
+		} else {
+			log.Println(">> [Event] UI became IDLE.")
 		}
+	case <-time.After(180 * time.Second):
+		return "", fmt.Errorf("global timeout waiting for response")
 	}
 
-done:
-	fmt.Println(">> Capture monitoring stopped")
+	// ---------------------------------------------------------
+	// 6. Result Extraction
+	// ---------------------------------------------------------
+	log.Println(">> Processing captured data...")
 
-	val, err := page.Evaluate("window._AI_ACCUMULATOR")
-	if err != nil {
-		return "", fmt.Errorf("failed to read spy data: %v", err)
+	// We try a few times in case the network handler is finalizing bytes
+	for i := 0; i < PARSE_ATTEMPTS; i++ {
+		captureMu.Lock()
+		currentData := make([][]byte, len(capturedBodies))
+		copy(currentData, capturedBodies)
+		captureMu.Unlock()
+
+		if len(currentData) > 0 {
+			fullText, err := parseAllChunks(currentData)
+			if err == nil && len(strings.TrimSpace(fullText)) > 0 {
+				log.Printf(">> Success! Extracted %d chars.\n", len(fullText))
+				return fullText, nil
+			}
+		}
+
+		log.Printf("   [Poll %d] Data not ready or empty. Retrying...\n", i+1)
+		time.Sleep(PARSE_INTERVAL)
 	}
 
-	rawText, ok := val.(string)
-	if !ok || rawText == "" {
-		return "", fmt.Errorf("captured network data was empty")
-	}
-
-	return parseGoogleRPCResponse([]byte(rawText))
+	return "", fmt.Errorf("no valid text extracted from %d network chunks", len(capturedBodies))
 }
 
 func buildPromptFromMessages(msgs []openai.ChatCompletionMessage) string {
@@ -338,11 +257,36 @@ func buildPromptFromMessages(msgs []openai.ChatCompletionMessage) string {
 	return sb.String()
 }
 
-func parseGoogleRPCResponse(body []byte) (string, error) {
+func parseAllChunks(bodies [][]byte) (string, error) {
+	var allTextSegments []string
+
+	for _, body := range bodies {
+		chunkText, err := parseSingleChunk(body)
+		if err == nil && chunkText != "" {
+			allTextSegments = append(allTextSegments, chunkText)
+		}
+	}
+
+	if len(allTextSegments) == 0 {
+		return "", fmt.Errorf("no valid text found")
+	}
+
+	return strings.Join(allTextSegments, ""), nil
+}
+
+func parseSingleChunk(body []byte) (string, error) {
 	rawStr := string(body)
+
+	// 1. Strip Google's XSSI prefix
+	if strings.HasPrefix(rawStr, ")]}'") {
+		rawStr = strings.TrimPrefix(rawStr, ")]}'")
+		rawStr = strings.TrimSpace(rawStr)
+	}
+
 	var raw []interface{}
 	err := json.Unmarshal([]byte(rawStr), &raw)
 
+	// 2. JSON Fixer
 	if err != nil {
 		openCount := strings.Count(rawStr, "[")
 		closeCount := strings.Count(rawStr, "]")
@@ -351,31 +295,26 @@ func parseGoogleRPCResponse(body []byte) (string, error) {
 			fixedStr := rawStr + strings.Repeat("]", missing)
 			err = json.Unmarshal([]byte(fixedStr), &raw)
 		}
-		if err != nil {
-			return "", fmt.Errorf("could not parse response: %v", err)
-		}
+	}
+
+	if err != nil {
+		return "", err
 	}
 
 	var textChunks []string
 	findTextChunks(raw, &textChunks)
-
-	if len(textChunks) == 0 {
-		return "", fmt.Errorf("no text chunks found in response")
-	}
-
 	return strings.Join(textChunks, ""), nil
 }
 
 func findTextChunks(data interface{}, chunks *[]string) {
 	switch v := data.(type) {
 	case []interface{}:
-		if len(v) == 2 {
+		if len(v) >= 2 {
 			if v[0] == nil {
 				if text, ok := v[1].(string); ok {
 					if !strings.HasPrefix(text, "v1_") && text != "model" && len(text) > 0 {
 						*chunks = append(*chunks, text)
 					}
-					return
 				}
 			}
 		}
