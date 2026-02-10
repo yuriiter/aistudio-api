@@ -14,7 +14,6 @@ import (
 	"github.com/playwright-community/playwright-go"
 )
 
-// Constants
 const (
 	NEW_PROMPT_PAGE     = "https://aistudio.google.com/prompts/new_chat"
 	GOOGLE_SIGNIN_PAGE  = "https://accounts.google.com"
@@ -27,12 +26,10 @@ type PlaywrightManager struct {
 	ChromeCmd *exec.Cmd
 	Browser   playwright.Browser
 	Context   playwright.BrowserContext
-	mu        sync.Mutex // Mutex to ensure thread-safe page creation
+	mu        sync.Mutex
 }
 
 var Manager *PlaywrightManager
-
-// --- Utility Functions ---
 
 func getChromeUserDataDir() string {
 	var userDataDir string
@@ -66,14 +63,15 @@ func getChromiumExecutable() string {
 	}
 }
 
-// --- Logic ---
-
-// InitAndConnect implements the logic: Headless Check -> Fail? -> Headful Login -> Loop
 func InitAndConnect() (*PlaywrightManager, error) {
+	if Manager != nil {
+		log.Println("Cleaning up previous manager instance before re-initialization...")
+		Manager.Cleanup()
+	}
+
 	for {
 		fmt.Println("\n--- Initialization Step 1: Starting Headless Verification ---")
 
-		// 1. Start a temporary manager for headless check
 		pm := &PlaywrightManager{}
 		var err error
 
@@ -82,21 +80,18 @@ func InitAndConnect() (*PlaywrightManager, error) {
 			return nil, fmt.Errorf("failed to start Playwright: %w", err)
 		}
 
-		// Start Headless
-		pm.ChromeCmd, err = pm.StartChromium(true) // true = HEADLESS
+		pm.ChromeCmd, err = pm.StartChromium(true)
 		if err != nil {
 			pm.pw.Stop()
 			return nil, err
 		}
 
-		// Connect
 		pm.Browser, err = pm.connectOverCDP()
 		if err != nil {
 			pm.Cleanup()
 			return nil, fmt.Errorf("failed to connect: %w", err)
 		}
 
-		// Create Context
 		contexts := pm.Browser.Contexts()
 		if len(contexts) == 0 {
 			pm.Context, err = pm.Browser.NewContext()
@@ -108,7 +103,6 @@ func InitAndConnect() (*PlaywrightManager, error) {
 			return nil, err
 		}
 
-		// Check Login Status
 		fmt.Println("Checking login status...")
 		loggedIn, err := pm.checkIfLoggedIn()
 		if err != nil {
@@ -118,32 +112,26 @@ func InitAndConnect() (*PlaywrightManager, error) {
 
 		if loggedIn {
 			fmt.Println(">> Status: LOGGED IN. Starting Server...")
-			Manager = pm // Set global
+			Manager = pm
 			return pm, nil
 		}
 
-		// 2. Not Logged In Logic
 		fmt.Println(">> Status: NOT LOGGED IN.")
 		fmt.Println(">> Closing headless browser and opening visible window for manual login.")
 
-		// Close the headless instance completely
 		pm.Cleanup()
-		time.Sleep(2 * time.Second) // Wait for port 9222 to free up
+		time.Sleep(2 * time.Second)
 
-		// 3. Open Headful Browser
-		// We don't need Playwright here, just the process to wait for.
 		err = runHeadfulLoginSession()
 		if err != nil {
 			return nil, err
 		}
 
-		// 4. User closed the window, loop back to Step 1 to verify
 		fmt.Println(">> Browser closed. Restarting background verification...")
 		time.Sleep(1 * time.Second)
 	}
 }
 
-// checkIfLoggedIn navigates to AI Studio and returns true if successful, false if redirected to login
 func (pm *PlaywrightManager) checkIfLoggedIn() (bool, error) {
 	page, err := pm.CreateNewPage()
 	if err != nil {
@@ -151,17 +139,14 @@ func (pm *PlaywrightManager) checkIfLoggedIn() (bool, error) {
 	}
 	defer page.Close()
 
-	// Short timeout for the check
 	_, err = page.Goto(NEW_PROMPT_PAGE, playwright.PageGotoOptions{
 		Timeout: playwright.Float(15000),
 	})
 
-	// If navigation fails entirely (e.g. no internet), return error
 	if err != nil {
-		// Sometimes goto fails on redirects, check URL anyway
 	}
 
-	time.Sleep(2 * time.Second) // Let redirects settle
+	time.Sleep(2 * time.Second)
 
 	url := page.URL()
 	if strings.Contains(url, "accounts.google.com") {
@@ -174,7 +159,6 @@ func (pm *PlaywrightManager) checkIfLoggedIn() (bool, error) {
 	return false, fmt.Errorf("unknown page loaded: %s", url)
 }
 
-// runHeadfulLoginSession starts Chrome visibly and BLOCKS until the user closes it
 func runHeadfulLoginSession() error {
 	userDataDir := getChromeUserDataDir()
 	chromiumExec := getChromiumExecutable()
@@ -187,11 +171,9 @@ func runHeadfulLoginSession() error {
 	fmt.Println("***************************************************")
 
 	args := []string{
-		// No remote-debugging-port needed here strictly, but good for consistency
-		// No headless flag
 		fmt.Sprintf("--user-data-dir=%s", userDataDir),
 		fmt.Sprintf("--profile-directory=%s", CHROME_PROFILE_NAME),
-		NEW_PROMPT_PAGE, // Open directly to the page
+		NEW_PROMPT_PAGE,
 	}
 
 	cmd := exec.Command(chromiumExec, args...)
@@ -202,15 +184,12 @@ func runHeadfulLoginSession() error {
 		return fmt.Errorf("failed to launch headful chrome: %w", err)
 	}
 
-	// This blocks until the user closes the window
 	if err := cmd.Wait(); err != nil {
-		// Ignore exit status errors (common when closing windows)
 	}
 
 	return nil
 }
 
-// StartChromium launches the browser process
 func (pm *PlaywrightManager) StartChromium(headless bool) (*exec.Cmd, error) {
 	userDataDir := getChromeUserDataDir()
 	chromiumExec := getChromiumExecutable()
@@ -221,15 +200,8 @@ func (pm *PlaywrightManager) StartChromium(headless bool) (*exec.Cmd, error) {
 		fmt.Sprintf("--profile-directory=%s", CHROME_PROFILE_NAME),
 	}
 
-	// if headless {
-	// 	args = append(args, "--headless=new")
-	// }
-
 	cmd := exec.Command(chromiumExec, args...)
-	// Suppress output in headless to keep logs clean, show in headful
 	if headless {
-		// cmd.Stdout = nil
-		// cmd.Stderr = nil
 	} else {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -241,12 +213,11 @@ func (pm *PlaywrightManager) StartChromium(headless bool) (*exec.Cmd, error) {
 	}
 
 	fmt.Printf("Chromium started (Headless: %v) PID: %d\n", headless, cmd.Process.Pid)
-	time.Sleep(2 * time.Second) // Give it a moment to start
+	time.Sleep(2 * time.Second)
 
 	return cmd, nil
 }
 
-// ConnectOverCDP connects Playwright to the running browser
 func (pm *PlaywrightManager) connectOverCDP() (playwright.Browser, error) {
 	cdpURL := fmt.Sprintf("http://localhost:%s", DEBUG_PORT)
 
@@ -260,7 +231,6 @@ func (pm *PlaywrightManager) connectOverCDP() (playwright.Browser, error) {
 	return nil, fmt.Errorf("failed to connect to Chrome CDP")
 }
 
-// Cleanup gracefully shuts down the browser and Playwright.
 func (pm *PlaywrightManager) Cleanup() {
 	if pm.Browser != nil {
 		pm.Browser.Close()
@@ -273,11 +243,25 @@ func (pm *PlaywrightManager) Cleanup() {
 	}
 }
 
-// CreateNewPage is a utility for API handlers to get a fresh page
-// It uses a Mutex to ensure thread safety when processing concurrent requests
 func (pm *PlaywrightManager) CreateNewPage() (playwright.Page, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	if pm.Browser == nil || !pm.Browser.IsConnected() {
+		log.Println("Browser disconnected, attempting restart...")
+
+		pm.Cleanup()
+
+		newPm, err := InitAndConnect()
+		if err != nil {
+			return nil, err
+		}
+
+		pm.pw = newPm.pw
+		pm.ChromeCmd = newPm.ChromeCmd
+		pm.Browser = newPm.Browser
+		pm.Context = newPm.Context
+	}
 
 	if pm.Context == nil {
 		return nil, fmt.Errorf("playwright context is not initialized")

@@ -18,10 +18,8 @@ func HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Call the automation service
 	responseText, err := services.ExecuteChatInteraction(req)
 	if err != nil {
-		// Return OpenAI formatted error
 		c.JSON(http.StatusInternalServerError, openai.APIError{
 			Error: openai.APIErrorDetail{
 				Message: err.Error(),
@@ -31,12 +29,11 @@ func HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Construct OpenAI Response Object
 	resp := openai.ChatCompletionResponse{
 		ID:      "chatcmpl-" + uuid.New().String(),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   req.Model, // Echo back the model request
+		Model:   req.Model,
 		Choices: []openai.ChatCompletionChoice{
 			{
 				Index: 0,
@@ -48,8 +45,6 @@ func HandleChatCompletions(c *gin.Context) {
 			},
 		},
 		Usage: openai.Usage{
-			// We can't easily count tokens without a tokenizer library,
-			// so we use dummy values or estimate based on string length (char / 4).
 			PromptTokens:     len(req.Messages[0].Content) / 4,
 			CompletionTokens: len(responseText) / 4,
 			TotalTokens:      (len(req.Messages[0].Content) + len(responseText)) / 4,
