@@ -234,19 +234,6 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 	}
 	defer page.Close()
 
-	var capturedImages []string
-	var captureMu sync.Mutex
-
-	// Hook to network intercept the incoming Base64 image chunks immediately
-	page.OnRequest(func(request playwright.Request) {
-		url := request.URL()
-		if strings.HasPrefix(url, "data:image/") {
-			captureMu.Lock()
-			capturedImages = append(capturedImages, url)
-			captureMu.Unlock()
-		}
-	})
-
 	targetURL := NEW_PROMPT_PAGE
 	if req.Model != "" {
 		targetURL = fmt.Sprintf("%s?model=%s", NEW_PROMPT_PAGE, req.Model)
@@ -302,7 +289,7 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 		if err := uploadFiles(page, attachedFiles); err != nil {
 			return nil, err
 		}
-		time.Sleep(2 * time.Second) // Give it time to attach to the UI before hitting run
+		time.Sleep(2 * time.Second) // Give it time to attach to the UI
 	}
 
 	log.Println(">> Filling prompt...")
@@ -321,9 +308,9 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 
 	time.Sleep(1 * time.Second)
 
-	captureMu.Lock()
-	capturedImages = nil // Clear cache or avatar loads
-	captureMu.Unlock()
+	// --- BEFORE RUN: Capture snapshot of existing images (Thumbnails) ---
+	beforeImages := getImagesFromDOM(page)
+	log.Printf(">> Captured %d existing images in DOM before generation.\n", len(beforeImages))
 
 	log.Println(">> Clicking Run...")
 	if err := runBtn.Click(); err != nil {
@@ -351,49 +338,20 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 		log.Println(">> [Event] UI became IDLE.")
 	}
 
-	time.Sleep(2 * time.Second) // Final yield to allow DOM renders & network events to complete
+	time.Sleep(2 * time.Second) // Final yield to allow DOM renders to complete
 
-	captureMu.Lock()
-	imgs := make([]string, len(capturedImages))
-	copy(imgs, capturedImages)
-	captureMu.Unlock()
+	// --- AFTER RUN: Extract new images ---
+	afterImages := getImagesFromDOM(page)
 
-	// Fallback DOM check if network missed the request (sometimes happens with dynamic elements)
-	if len(imgs) == 0 {
-		log.Println(">> No images in network requests, checking DOM...")
-		evalResult, err := page.Evaluate(`() => {
-			return Array.from(document.querySelectorAll('img'))
-				.map(img => img.src)
-				.filter(src => src.startsWith('data:image/'));
-		}`)
-		if err == nil && evalResult != nil {
-			if arr, ok := evalResult.([]interface{}); ok {
-				for _, v := range arr {
-					if str, ok := v.(string); ok {
-						imgs = append(imgs, str)
-					}
-				}
-			}
-		}
-	}
-
-	if len(imgs) == 0 {
-		return nil, fmt.Errorf("no images found after generation")
-	}
-
-	// Deduplication and small icon filtering
-	// Data URLs > 5000 characters ensures we omit purely small UI icons loaded onto the canvas
 	uniqueImgs := make([]string, 0)
-	seen := make(map[string]bool)
-	for _, img := range imgs {
-		if len(img) > 5000 && !seen[img] {
-			seen[img] = true
-			uniqueImgs = append(uniqueImgs, img)
+	for imgStr := range afterImages {
+		if !beforeImages[imgStr] && len(imgStr) > 5000 {
+			uniqueImgs = append(uniqueImgs, imgStr)
 		}
 	}
 
 	if len(uniqueImgs) == 0 {
-		return nil, fmt.Errorf("found data images, but they were likely UI icons (too small)")
+		return nil, fmt.Errorf("no newly generated images found (found %d total images, but they were all present before generation or too small)", len(afterImages))
 	}
 
 	log.Printf(">> Successfully captured %d unique image(s).\n", len(uniqueImgs))
@@ -407,6 +365,48 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 }
 
 // === UTILITIES ===
+
+func getImagesFromDOM(page playwright.Page) map[string]bool {
+	// Evaluates the DOM. Converts both standard base64 data URIs and object Blobs to Data URIs.
+	script := `async () => {
+		const imgs = Array.from(document.querySelectorAll('img'));
+		const results = [];
+		for (const img of imgs) {
+			const src = img.src;
+			if (!src) continue;
+			if (src.startsWith('data:image/')) {
+				results.push(src);
+			} else if (src.startsWith('blob:')) {
+				try {
+					const response = await fetch(src);
+					const blob = await response.blob();
+					const reader = new FileReader();
+					const b64 = await new Promise(resolve => {
+						reader.onloadend = () => resolve(reader.result);
+						reader.readAsDataURL(blob);
+					});
+					results.push(b64);
+				} catch (e) {
+					console.error("Failed to read blob:", e);
+				}
+			}
+		}
+		return results;
+	}`
+
+	imagesMap := make(map[string]bool)
+	evalResult, err := page.Evaluate(script)
+	if err == nil && evalResult != nil {
+		if arr, ok := evalResult.([]interface{}); ok {
+			for _, v := range arr {
+				if str, ok := v.(string); ok {
+					imagesMap[str] = true
+				}
+			}
+		}
+	}
+	return imagesMap
+}
 
 func uploadFiles(page playwright.Page, files []string) error {
 	if len(files) == 0 {
@@ -536,7 +536,6 @@ func mapSizeToAspectRatio(size string) string {
 		return "1:1"
 	}
 
-	// Supported straight match by Studio UI dropdown
 	validRatios := []string{"Auto", "1:1", "9:16", "16:9", "3:4", "4:3", "3:2", "2:3", "5:4", "4:5", "21:9"}
 	for _, r := range validRatios {
 		if size == r {
@@ -544,7 +543,6 @@ func mapSizeToAspectRatio(size string) string {
 		}
 	}
 
-	// Map typical OpenAI dimensions -> Studio Native Option
 	switch size {
 	case "256x256", "512x512", "1024x1024":
 		return "1:1"
@@ -554,7 +552,6 @@ func mapSizeToAspectRatio(size string) string {
 		return "16:9"
 	}
 
-	// Default
 	return "1:1"
 }
 
