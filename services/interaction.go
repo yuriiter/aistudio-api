@@ -20,6 +20,8 @@ const (
 
 	SELECTOR_RUN_IDLE = "ms-run-button button[type='submit']"
 	SELECTOR_RUN_BUSY = "ms-run-button button[type='button']"
+
+	SELECTOR_ASPECT_RATIO = `mat-select[aria-label="Aspect ratio"]`
 )
 
 const (
@@ -205,6 +207,208 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 
 	return "", fmt.Errorf("no valid text extracted from %d network chunks", len(capturedBodies))
 }
+
+func ExecuteImageGeneration(req openai.ImageRequest) ([]string, error) {
+	var lastErr error
+
+	for i := 0; i < MAX_RETRIES; i++ {
+		if i > 0 {
+			log.Printf(">> [Image Retry] Attempt %d/%d starting in %v...\n", i+1, MAX_RETRIES, RETRY_DELAY)
+			time.Sleep(RETRY_DELAY)
+		}
+
+		log.Printf(">> [Image Attempt %d] Starting generation...\n", i+1)
+		responses, err := executeImageAttempt(req)
+		if err == nil && len(responses) > 0 {
+			return responses, nil
+		}
+
+		log.Printf(">> [Image Attempt %d] Failed: %v\n", i+1, err)
+		lastErr = err
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts. Last error: %v", MAX_RETRIES, lastErr)
+}
+
+func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
+	page, err := Manager.CreateNewPage()
+	if err != nil {
+		return nil, err
+	}
+	defer page.Close()
+
+	var capturedImages []string
+	var captureMu sync.Mutex
+
+	// Hook to network intercept the incoming Base64 image chunks immediately
+	page.OnRequest(func(request playwright.Request) {
+		url := request.URL()
+		if strings.HasPrefix(url, "data:image/") {
+			captureMu.Lock()
+			capturedImages = append(capturedImages, url)
+			captureMu.Unlock()
+		}
+	})
+
+	targetURL := NEW_PROMPT_PAGE
+	if req.Model != "" {
+		targetURL = fmt.Sprintf("%s?model=%s", NEW_PROMPT_PAGE, req.Model)
+	}
+
+	log.Println(">> Navigating to AI Studio for Image Gen...")
+	if _, err := page.Goto(targetURL, playwright.PageGotoOptions{Timeout: playwright.Float(30000)}); err != nil {
+		return nil, fmt.Errorf("navigation failed: %v", err)
+	}
+
+	time.Sleep(2 * time.Second) // Let SPA elements and options stabilize
+
+	// Select Aspect Ratio mapping
+	aspectRatio := mapSizeToAspectRatio(req.Size)
+	arSelect := page.Locator(SELECTOR_ASPECT_RATIO).First()
+	if err := arSelect.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(4000)}); err == nil {
+		arSelect.Click()
+		ratioOption := page.Locator("mat-option").GetByText(aspectRatio, playwright.LocatorGetByTextOptions{Exact: playwright.Bool(true)}).First()
+		if err := ratioOption.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(2000)}); err == nil {
+			ratioOption.Click()
+			log.Printf(">> Aspect ratio set to %s\n", aspectRatio)
+		} else {
+			log.Printf(">> Warning: Aspect ratio option '%s' not found.\n", aspectRatio)
+			page.Keyboard().Press("Escape") // Close dropdown
+		}
+	} else {
+		log.Println(">> Warning: Aspect ratio selector not found. Proceeding with default.")
+	}
+
+	log.Println(">> Filling prompt...")
+	textarea := page.Locator(SELECTOR_TEXTAREA).First()
+	if err := textarea.WaitFor(); err != nil {
+		return nil, fmt.Errorf("textarea not found")
+	}
+	if err := textarea.Fill(req.Prompt); err != nil {
+		return nil, fmt.Errorf("failed to fill prompt: %v", err)
+	}
+
+	runBtn := page.Locator(SELECTOR_RUN_IDLE).First()
+	if err := runBtn.WaitFor(); err != nil {
+		return nil, fmt.Errorf("run button not found")
+	}
+
+	time.Sleep(1 * time.Second)
+
+	captureMu.Lock()
+	capturedImages = nil // Clear cache or avatar loads
+	captureMu.Unlock()
+
+	log.Println(">> Clicking Run...")
+	if err := runBtn.Click(); err != nil {
+		textarea.Press("Control+Enter")
+	}
+
+	log.Println(">> Waiting for UI to switch to BUSY...")
+	busyBtn := page.Locator(SELECTOR_RUN_BUSY).First()
+	err = busyBtn.WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(15000),
+	})
+	if err == nil {
+		log.Println(">> UI is BUSY. Image generation started.")
+	}
+
+	log.Println(">> Waiting for completion...")
+	err = busyBtn.WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateHidden,
+		Timeout: playwright.Float(120000),
+	})
+	if err != nil {
+		log.Printf("!! Warning: UI wait for hidden timed out: %v\n", err)
+	} else {
+		log.Println(">> [Event] UI became IDLE.")
+	}
+
+	time.Sleep(2 * time.Second) // Final yield to allow DOM renders & network events to complete
+
+	captureMu.Lock()
+	imgs := make([]string, len(capturedImages))
+	copy(imgs, capturedImages)
+	captureMu.Unlock()
+
+	// Fallback DOM check if network missed the request (sometimes happens with dynamic elements)
+	if len(imgs) == 0 {
+		log.Println(">> No images in network requests, checking DOM...")
+		evalResult, err := page.Evaluate(`() => {
+			return Array.from(document.querySelectorAll('img'))
+				.map(img => img.src)
+				.filter(src => src.startsWith('data:image/'));
+		}`)
+		if err == nil && evalResult != nil {
+			if arr, ok := evalResult.([]interface{}); ok {
+				for _, v := range arr {
+					if str, ok := v.(string); ok {
+						imgs = append(imgs, str)
+					}
+				}
+			}
+		}
+	}
+
+	if len(imgs) == 0 {
+		return nil, fmt.Errorf("no images found after generation")
+	}
+
+	// Deduplication and small icon filtering
+	// Data URLs > 5000 characters ensures we omit purely small UI icons loaded onto the canvas
+	uniqueImgs := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, img := range imgs {
+		if len(img) > 5000 && !seen[img] {
+			seen[img] = true
+			uniqueImgs = append(uniqueImgs, img)
+		}
+	}
+
+	if len(uniqueImgs) == 0 {
+		return nil, fmt.Errorf("found data images, but they were likely UI icons (too small)")
+	}
+
+	log.Printf(">> Successfully captured %d unique image(s).\n", len(uniqueImgs))
+
+	// Honor the N limit (if available)
+	n := req.N
+	if len(uniqueImgs) > n {
+		uniqueImgs = uniqueImgs[:n]
+	}
+
+	return uniqueImgs, nil
+}
+
+func mapSizeToAspectRatio(size string) string {
+	if size == "" {
+		return "1:1"
+	}
+
+	// Supported straight match by Studio UI dropdown
+	validRatios := []string{"Auto", "1:1", "9:16", "16:9", "3:4", "4:3", "3:2", "2:3", "5:4", "4:5", "21:9"}
+	for _, r := range validRatios {
+		if size == r {
+			return r
+		}
+	}
+
+	// Map typical OpenAI dimensions -> Studio Native Option
+	switch size {
+	case "256x256", "512x512", "1024x1024":
+		return "1:1"
+	case "1024x1792":
+		return "9:16"
+	case "1792x1024":
+		return "16:9"
+	}
+
+	// Default
+	return "1:1"
+}
+
+// === EXISTING CHAT HELPERS ===
 
 func buildPromptFromMessages(msgs []openai.ChatCompletionMessage) string {
 	var sb strings.Builder

@@ -50,3 +50,23 @@ type APIErrorDetail struct {
 type APIError struct {
 	Error APIErrorDetail `json:"error"`
 }
+
+// Image Generation Types
+type ImageRequest struct {
+	Prompt         string `json:"prompt"`
+	Model          string `json:"model,omitempty"`
+	N              int    `json:"n,omitempty"`
+	Size           string `json:"size,omitempty"`
+	ResponseFormat string `json:"response_format,omitempty"` // "url" or "b64_json"
+	User           string `json:"user,omitempty"`
+}
+
+type ImageData struct {
+	URL     string `json:"url,omitempty"`
+	B64JSON string `json:"b64_json,omitempty"`
+}
+
+type ImageResponse struct {
+	Created int64       `json:"created"`
+	Data    []ImageData `json:"data"`
+}

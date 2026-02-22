@@ -24,6 +24,7 @@ func main() {
 
 	r.GET("/api/status", handleStatus)
 	r.POST("/v1/chat/completions", HandleChatCompletions)
+	r.POST("/v1/images/generations", HandleImageGenerations)
 
 	srv := &http.Server{
 		Addr:    ":8080",
