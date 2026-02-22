@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -31,6 +32,8 @@ const (
 	PARSE_ATTEMPTS = 5
 	PARSE_INTERVAL = 200 * time.Millisecond
 )
+
+// === CORE WORKFLOWS ===
 
 func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 	var lastErr error
@@ -101,8 +104,11 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 		return "", fmt.Errorf("navigation failed: %v", err)
 	}
 
-	log.Println(">> Preparing prompt file...")
-	fullPrompt := buildPromptFromMessages(req.Messages)
+	// 1. Process Messages (Text + Media)
+	log.Println(">> Parsing prompt and attachments...")
+	fullPrompt, attachedFiles := parseChatMessages(req.Messages)
+
+	// 2. Prepare master text file
 	tmpFile, err := os.CreateTemp("", "aistudio-prompt-*.txt")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file: %v", err)
@@ -112,37 +118,28 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 	}
 	tmpFilePath := tmpFile.Name()
 	tmpFile.Close()
-	defer os.Remove(tmpFilePath)
 
-	addMediaBtn := page.Locator(SELECTOR_ADD_MEDIA_BTN).First()
-	if err := addMediaBtn.WaitFor(); err != nil {
-		return "", fmt.Errorf("add media button not found")
-	}
-	addMediaBtn.Click()
+	// Compile all files to upload
+	allUploadFiles := append([]string{tmpFilePath}, attachedFiles...)
 
-	uploadBtn := page.GetByText(SELECTOR_UPLOAD_TEXT).First()
-	if err := uploadBtn.WaitFor(playwright.LocatorWaitForOptions{State: playwright.WaitForSelectorStateVisible}); err != nil {
-		return "", fmt.Errorf("upload text not found")
-	}
-	time.Sleep(500 * time.Millisecond)
+	// Cleanup all temp files later
+	defer func() {
+		for _, file := range allUploadFiles {
+			os.Remove(file)
+		}
+	}()
 
-	fileChooser, err := page.ExpectFileChooser(func() error {
-		return uploadBtn.Click()
-	})
-	if err != nil {
-		return "", fmt.Errorf("file chooser failed: %v", err)
+	// 3. Upload files
+	if err := uploadFiles(page, allUploadFiles); err != nil {
+		return "", err
 	}
-	if err := fileChooser.SetFiles([]string{tmpFilePath}); err != nil {
-		return "", fmt.Errorf("failed to set files: %v", err)
-	}
-	log.Println(">> File attached.")
 
 	runBtn := page.Locator(SELECTOR_RUN_IDLE).First()
 	if err := runBtn.WaitFor(); err != nil {
 		return "", fmt.Errorf("run button not found")
 	}
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second) // Let file uploads finish processing on UI
 
 	log.Println(">> Clicking Run...")
 	if err := runBtn.Click(); err != nil {
@@ -279,6 +276,35 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 		log.Println(">> Warning: Aspect ratio selector not found. Proceeding with default.")
 	}
 
+	// Extract and prepare input files (images)
+	var attachedFiles []string
+	if req.Image != "" && strings.HasPrefix(req.Image, "data:") {
+		if path, err := writeDataURIToTempFile(req.Image); err == nil {
+			attachedFiles = append(attachedFiles, path)
+		}
+	}
+	for _, fUri := range req.Files {
+		if strings.HasPrefix(fUri, "data:") {
+			if path, err := writeDataURIToTempFile(fUri); err == nil {
+				attachedFiles = append(attachedFiles, path)
+			}
+		}
+	}
+
+	defer func() {
+		for _, f := range attachedFiles {
+			os.Remove(f)
+		}
+	}()
+
+	if len(attachedFiles) > 0 {
+		log.Printf(">> Uploading %d input files...\n", len(attachedFiles))
+		if err := uploadFiles(page, attachedFiles); err != nil {
+			return nil, err
+		}
+		time.Sleep(2 * time.Second) // Give it time to attach to the UI before hitting run
+	}
+
 	log.Println(">> Filling prompt...")
 	textarea := page.Locator(SELECTOR_TEXTAREA).First()
 	if err := textarea.WaitFor(); err != nil {
@@ -372,13 +398,137 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 
 	log.Printf(">> Successfully captured %d unique image(s).\n", len(uniqueImgs))
 
-	// Honor the N limit (if available)
 	n := req.N
 	if len(uniqueImgs) > n {
 		uniqueImgs = uniqueImgs[:n]
 	}
 
 	return uniqueImgs, nil
+}
+
+// === UTILITIES ===
+
+func uploadFiles(page playwright.Page, files []string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	addMediaBtn := page.Locator(SELECTOR_ADD_MEDIA_BTN).First()
+	if err := addMediaBtn.WaitFor(); err != nil {
+		return fmt.Errorf("add media button not found")
+	}
+	addMediaBtn.Click()
+
+	uploadBtn := page.GetByText(SELECTOR_UPLOAD_TEXT).First()
+	if err := uploadBtn.WaitFor(playwright.LocatorWaitForOptions{State: playwright.WaitForSelectorStateVisible}); err != nil {
+		return fmt.Errorf("upload text not found")
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	fileChooser, err := page.ExpectFileChooser(func() error {
+		return uploadBtn.Click()
+	})
+	if err != nil {
+		return fmt.Errorf("file chooser failed: %v", err)
+	}
+
+	if err := fileChooser.SetFiles(files); err != nil {
+		return fmt.Errorf("failed to set files: %v", err)
+	}
+	log.Println(">> Files attached successfully.")
+	return nil
+}
+
+func parseChatMessages(msgs []openai.ChatCompletionMessage) (string, []string) {
+	var sb strings.Builder
+	var files []string
+
+	for _, msg := range msgs {
+		role := strings.ToUpper(msg.Role)
+		if strings.ToLower(msg.Role) == "system" {
+			role = "SYSTEM PROMPT"
+		}
+
+		switch v := msg.Content.(type) {
+		case string:
+			sb.WriteString(fmt.Sprintf("%s: %s\n\n", role, v))
+		case []interface{}:
+			sb.WriteString(fmt.Sprintf("%s: ", role))
+			for _, itemInterface := range v {
+				item, ok := itemInterface.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				typeStr, _ := item["type"].(string)
+
+				if typeStr == "text" {
+					textStr, _ := item["text"].(string)
+					sb.WriteString(textStr + "\n")
+				} else if typeStr == "image_url" || typeStr == "file_url" {
+					urlMap, ok := item[typeStr].(map[string]interface{})
+					if !ok {
+						continue
+					}
+					urlStr, _ := urlMap["url"].(string)
+
+					if strings.HasPrefix(urlStr, "data:") {
+						path, err := writeDataURIToTempFile(urlStr)
+						if err == nil {
+							files = append(files, path)
+							sb.WriteString(fmt.Sprintf("[Attached File]\n"))
+						} else {
+							log.Printf("Failed to process data URI: %v", err)
+						}
+					} else {
+						sb.WriteString(fmt.Sprintf("[External File URL: %s]\n", urlStr))
+					}
+				}
+			}
+			sb.WriteString("\n")
+		}
+	}
+	sb.WriteString("ASSISTANT: ")
+	return sb.String(), files
+}
+
+func writeDataURIToTempFile(dataURI string) (string, error) {
+	parts := strings.SplitN(dataURI, ",", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid data URI")
+	}
+
+	mime := strings.TrimPrefix(parts[0], "data:")
+	mime = strings.TrimSuffix(mime, ";base64")
+
+	ext := ".bin"
+	if strings.Contains(mime, "jpeg") || strings.Contains(mime, "jpg") {
+		ext = ".jpg"
+	} else if strings.Contains(mime, "png") {
+		ext = ".png"
+	} else if strings.Contains(mime, "webp") {
+		ext = ".webp"
+	} else if strings.Contains(mime, "pdf") {
+		ext = ".pdf"
+	} else if strings.Contains(mime, "csv") {
+		ext = ".csv"
+	} else if strings.Contains(mime, "text/plain") {
+		ext = ".txt"
+	}
+
+	data, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", err
+	}
+
+	tmpFile, err := os.CreateTemp("", "aistudio-upload-*"+ext)
+	if err != nil {
+		return "", err
+	}
+	defer tmpFile.Close()
+
+	if _, err = tmpFile.Write(data); err != nil {
+		return "", err
+	}
+	return tmpFile.Name(), nil
 }
 
 func mapSizeToAspectRatio(size string) string {
@@ -408,21 +558,7 @@ func mapSizeToAspectRatio(size string) string {
 	return "1:1"
 }
 
-// === EXISTING CHAT HELPERS ===
-
-func buildPromptFromMessages(msgs []openai.ChatCompletionMessage) string {
-	var sb strings.Builder
-	for _, msg := range msgs {
-		role := strings.ToLower(msg.Role)
-		if role == "system" {
-			sb.WriteString(fmt.Sprintf("SYSTEM PROMPT: %s\n\n", msg.Content))
-		} else {
-			sb.WriteString(fmt.Sprintf("%s: %s\n\n", strings.ToUpper(role), msg.Content))
-		}
-	}
-	sb.WriteString("ASSISTANT: ")
-	return sb.String()
-}
+// === EXISTING PARSING CHUNKS ===
 
 func parseAllChunks(bodies [][]byte) (string, error) {
 	var allTextSegments []string

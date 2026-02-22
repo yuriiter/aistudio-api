@@ -2,7 +2,7 @@ package openai
 
 type ChatCompletionMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"` // Typed as `any` to support both string and OpenAI Vision array structure
 }
 
 type ChatCompletionRequest struct {
@@ -53,12 +53,14 @@ type APIError struct {
 
 // Image Generation Types
 type ImageRequest struct {
-	Prompt         string `json:"prompt"`
-	Model          string `json:"model,omitempty"`
-	N              int    `json:"n,omitempty"`
-	Size           string `json:"size,omitempty"`
-	ResponseFormat string `json:"response_format,omitempty"` // "url" or "b64_json"
-	User           string `json:"user,omitempty"`
+	Prompt         string   `json:"prompt"`
+	Model          string   `json:"model,omitempty"`
+	N              int      `json:"n,omitempty"`
+	Size           string   `json:"size,omitempty"`
+	ResponseFormat string   `json:"response_format,omitempty"` // "url" or "b64_json"
+	User           string   `json:"user,omitempty"`
+	Image          string   `json:"image,omitempty"` // Input image/file (Base64 data URI)
+	Files          []string `json:"files,omitempty"` // Additional input files (Base64 data URIs)
 }
 
 type ImageData struct {

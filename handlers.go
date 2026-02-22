@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -30,6 +31,12 @@ func HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// Rough estimate for tokens based on content format
+	promptLength := 0
+	if len(req.Messages) > 0 {
+		promptLength = len(fmt.Sprint(req.Messages[0].Content))
+	}
+
 	resp := openai.ChatCompletionResponse{
 		ID:      "chatcmpl-" + uuid.New().String(),
 		Object:  "chat.completion",
@@ -46,9 +53,9 @@ func HandleChatCompletions(c *gin.Context) {
 			},
 		},
 		Usage: openai.Usage{
-			PromptTokens:     len(req.Messages[0].Content) / 4,
+			PromptTokens:     promptLength / 4,
 			CompletionTokens: len(responseText) / 4,
-			TotalTokens:      (len(req.Messages[0].Content) + len(responseText)) / 4,
+			TotalTokens:      (promptLength + len(responseText)) / 4,
 		},
 	}
 
@@ -64,9 +71,6 @@ func HandleImageGenerations(c *gin.Context) {
 
 	// === SET DEFAULTS FOR IMAGE GENERATION ===
 	if req.Model == "" {
-		// Default to the image generation model so the URL is built correctly.
-		// Note: Google's official Imagen 3 ID is often "imagen-3.0-generate-002".
-		// We will use your requested default here.
 		req.Model = "gemini-2.5-flash-image"
 	}
 	if req.N <= 0 {
