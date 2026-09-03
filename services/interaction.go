@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"aistudio-api/openai"
@@ -27,7 +27,6 @@ const (
 
 const (
 	MAX_RETRIES = 3
-	RETRY_DELAY = 2 * time.Second
 
 	PARSE_ATTEMPTS = 5
 	PARSE_INTERVAL = 200 * time.Millisecond
@@ -40,8 +39,9 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 
 	for i := 0; i < MAX_RETRIES; i++ {
 		if i > 0 {
-			log.Printf(">> [Retry] Attempt %d/%d starting in %v...\n", i+1, MAX_RETRIES, RETRY_DELAY)
-			time.Sleep(RETRY_DELAY)
+			delay := retryDelay()
+			log.Printf(">> [Retry] Attempt %d/%d starting in %v...\n", i+1, MAX_RETRIES, delay)
+			time.Sleep(delay)
 		}
 
 		log.Printf(">> [Attempt %d] Starting interaction...\n", i+1)
@@ -58,41 +58,17 @@ func ExecuteChatInteraction(req openai.ChatCompletionRequest) (string, error) {
 }
 
 func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
-	page, err := Manager.CreateNewPage()
+	page, err := Manager.AcquireRunPage()
 	if err != nil {
 		return "", err
 	}
-	defer page.Close()
+	defer Manager.ReleaseRunPage()
 
-	var capturedBodies [][]byte
-	var captureMu sync.Mutex
-
-	networkFinishedChan := make(chan bool, 1)
-
-	page.OnResponse(func(response playwright.Response) {
-		if strings.Contains(response.URL(), "GenerateContent") {
-			log.Println(">> [Net] Detected 'GenerateContent' stream...")
-
-			go func() {
-				body, err := response.Body()
-				if err != nil {
-					log.Printf("!! [Net] Error reading body: %v\n", err)
-					return
-				}
-
-				log.Printf(">> [Net] Stream closed. Captured %d bytes.\n", len(body))
-
-				captureMu.Lock()
-				capturedBodies = append(capturedBodies, body)
-				captureMu.Unlock()
-
-				select {
-				case networkFinishedChan <- true:
-				default:
-				}
-			}()
-		}
-	})
+	// Reset capture bucket for this run.
+	capture.mu.Lock()
+	capture.bodies = nil
+	capture.done = make(chan bool, 1)
+	capture.mu.Unlock()
 
 	targetURL := NEW_PROMPT_PAGE
 	if req.Model != "" {
@@ -103,6 +79,8 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 	if _, err := page.Goto(targetURL, playwright.PageGotoOptions{Timeout: playwright.Float(30000)}); err != nil {
 		return "", fmt.Errorf("navigation failed: %v", err)
 	}
+
+	warmUpPage(page)
 
 	// 1. Process Messages (Text + Media)
 	log.Println(">> Parsing prompt and attachments...")
@@ -141,8 +119,10 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 
 	time.Sleep(2 * time.Second) // Let file uploads finish processing on UI
 
+	humanPause()
+
 	log.Println(">> Clicking Run...")
-	if err := runBtn.Click(); err != nil {
+	if err := humanClick(page, runBtn); err != nil {
 		page.Locator(SELECTOR_TEXTAREA).Press("Control+Enter")
 	}
 
@@ -170,7 +150,7 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 	}()
 
 	select {
-	case <-networkFinishedChan:
+	case <-capture.done:
 		log.Println(">> [Event] Network stream finished! (Bypassing UI wait)")
 	case err := <-uiIdleChan:
 		if err != nil {
@@ -185,10 +165,10 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 	log.Println(">> Processing captured data...")
 
 	for i := 0; i < PARSE_ATTEMPTS; i++ {
-		captureMu.Lock()
-		currentData := make([][]byte, len(capturedBodies))
-		copy(currentData, capturedBodies)
-		captureMu.Unlock()
+		capture.mu.Lock()
+		currentData := make([][]byte, len(capture.bodies))
+		copy(currentData, capture.bodies)
+		capture.mu.Unlock()
 
 		if len(currentData) > 0 {
 			fullText, err := parseAllChunks(currentData)
@@ -202,7 +182,10 @@ func executeAttempt(req openai.ChatCompletionRequest) (string, error) {
 		time.Sleep(PARSE_INTERVAL)
 	}
 
-	return "", fmt.Errorf("no valid text extracted from %d network chunks", len(capturedBodies))
+	capture.mu.Lock()
+	n := len(capture.bodies)
+	capture.mu.Unlock()
+	return "", fmt.Errorf("no valid text extracted from %d network chunks", n)
 }
 
 func ExecuteImageGeneration(req openai.ImageRequest) ([]string, error) {
@@ -210,8 +193,9 @@ func ExecuteImageGeneration(req openai.ImageRequest) ([]string, error) {
 
 	for i := 0; i < MAX_RETRIES; i++ {
 		if i > 0 {
-			log.Printf(">> [Image Retry] Attempt %d/%d starting in %v...\n", i+1, MAX_RETRIES, RETRY_DELAY)
-			time.Sleep(RETRY_DELAY)
+			delay := retryDelay()
+			log.Printf(">> [Image Retry] Attempt %d/%d starting in %v...\n", i+1, MAX_RETRIES, delay)
+			time.Sleep(delay)
 		}
 
 		log.Printf(">> [Image Attempt %d] Starting generation...\n", i+1)
@@ -228,11 +212,11 @@ func ExecuteImageGeneration(req openai.ImageRequest) ([]string, error) {
 }
 
 func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
-	page, err := Manager.CreateNewPage()
+	page, err := Manager.AcquireRunPage()
 	if err != nil {
 		return nil, err
 	}
-	defer page.Close()
+	defer Manager.ReleaseRunPage()
 
 	targetURL := NEW_PROMPT_PAGE
 	if req.Model != "" {
@@ -244,7 +228,7 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 		return nil, fmt.Errorf("navigation failed: %v", err)
 	}
 
-	time.Sleep(2 * time.Second) // Let SPA elements and options stabilize
+	warmUpPage(page)
 
 	// Select Aspect Ratio mapping
 	aspectRatio := mapSizeToAspectRatio(req.Size)
@@ -292,14 +276,16 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 		time.Sleep(2 * time.Second) // Give it time to attach to the UI
 	}
 
-	log.Println(">> Filling prompt...")
+	log.Println(">> Typing prompt...")
 	textarea := page.Locator(SELECTOR_TEXTAREA).First()
 	if err := textarea.WaitFor(); err != nil {
 		return nil, fmt.Errorf("textarea not found")
 	}
-	if err := textarea.Fill(req.Prompt); err != nil {
-		return nil, fmt.Errorf("failed to fill prompt: %v", err)
+	if err := humanType(textarea, req.Prompt); err != nil {
+		return nil, fmt.Errorf("failed to type prompt: %v", err)
 	}
+
+	humanPause()
 
 	runBtn := page.Locator(SELECTOR_RUN_IDLE).First()
 	if err := runBtn.WaitFor(); err != nil {
@@ -307,13 +293,14 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 	}
 
 	time.Sleep(1 * time.Second)
+	humanPause()
 
 	// --- BEFORE RUN: Capture snapshot of existing images (Thumbnails) ---
 	beforeImages := getImagesFromDOM(page)
 	log.Printf(">> Captured %d existing images in DOM before generation.\n", len(beforeImages))
 
 	log.Println(">> Clicking Run...")
-	if err := runBtn.Click(); err != nil {
+	if err := humanClick(page, runBtn); err != nil {
 		textarea.Press("Control+Enter")
 	}
 
@@ -365,6 +352,116 @@ func executeImageAttempt(req openai.ImageRequest) ([]string, error) {
 }
 
 // === UTILITIES ===
+
+// humanPause waits a human-like random interval between discrete UI actions.
+func humanPause() {
+	delay := 400 + rand.Intn(1200)
+	time.Sleep(time.Duration(delay) * time.Millisecond)
+}
+
+// retryDelay returns a long, jittered backoff so repeated failures don't hammer
+// the GenerateContent endpoint (instant retries are a classic abuse signal).
+func retryDelay() time.Duration {
+	delay := 12000 + rand.Intn(18000)
+	return time.Duration(delay) * time.Millisecond
+}
+
+// warmUpPage spends a few seconds moving the mouse and scrolling like a person
+// settling into the page. This accumulates the engagement signals Google's
+// risk-scoring uses before the GenerateContent request is fired.
+func warmUpPage(page playwright.Page) {
+	steps := 3 + rand.Intn(3)
+	for i := 0; i < steps; i++ {
+		x := float64(200 + rand.Intn(1200))
+		y := float64(200 + rand.Intn(600))
+		if err := page.Mouse().Move(x, y, playwright.MouseMoveOptions{Steps: playwright.Int(15 + rand.Intn(25))}); err != nil {
+			break
+		}
+		time.Sleep(time.Duration(150+rand.Intn(350)) * time.Millisecond)
+	}
+	// A light scroll, like scanning the page.
+	if err := page.Mouse().Wheel(0, float64(60+rand.Intn(120))); err == nil {
+		time.Sleep(300 * time.Millisecond)
+		page.Mouse().Wheel(0, 0)
+	}
+	humanPause()
+}
+
+// humanClick clicks a locator the way a person would: eases the cursor to the
+// target with several interpolated moves, then presses and releases with a
+// pause in between (no teleport, no instantaneous 2ms click).
+func humanClick(page playwright.Page, locator playwright.Locator) error {
+	if err := locator.ScrollIntoViewIfNeeded(); err != nil {
+		return err
+	}
+
+	box, err := locator.BoundingBox()
+	if err != nil {
+		log.Printf("!! humanClick: bounding box failed: %v\n", err)
+		return locator.Click()
+	}
+
+	// Aim slightly off-center, like a person.
+	jitterX := (rand.Float64()*2 - 1) * box.Width * 0.2
+	jitterY := (rand.Float64()*2 - 1) * box.Height * 0.2
+	targetX := box.X + box.Width/2 + jitterX
+	targetY := box.Y + box.Height/2 + jitterY
+
+	// A few approach moves before landing on the target.
+	waypoints := 2 + rand.Intn(3)
+	for i := 1; i <= waypoints; i++ {
+		t := float64(i) / float64(waypoints+1)
+		wx := box.X + (targetX-box.X)*t + (rand.Float64()*2-1)*40
+		wy := box.Y + (targetY-box.Y)*t + (rand.Float64()*2-1)*40
+		if err := page.Mouse().Move(wx, wy, playwright.MouseMoveOptions{Steps: playwright.Int(10 + rand.Intn(15))}); err != nil {
+			return err
+		}
+		time.Sleep(time.Duration(60+rand.Intn(180)) * time.Millisecond)
+	}
+
+	if err := page.Mouse().Move(targetX, targetY, playwright.MouseMoveOptions{Steps: playwright.Int(8)}); err != nil {
+		return err
+	}
+	time.Sleep(time.Duration(120+rand.Intn(240)) * time.Millisecond)
+
+	if err := page.Mouse().Down(); err != nil {
+		return err
+	}
+	time.Sleep(time.Duration(80+rand.Intn(160)) * time.Millisecond)
+	if err := page.Mouse().Up(); err != nil {
+		return err
+	}
+	humanPause()
+	return nil
+}
+
+// humanType types text like a person: focuses the field, clears it, then sends
+// real per-key events with randomized inter-key delays. This avoids the
+// instant single-input-event `Fill` which AI Studio treats as an automated bot.
+func humanType(locator playwright.Locator, text string) error {
+	if err := locator.Click(); err != nil {
+		return err
+	}
+
+	if err := locator.Press("Control+A"); err != nil {
+		return err
+	}
+	if err := locator.Press("Backspace"); err != nil {
+		return err
+	}
+
+	humanPause()
+
+	delay := 40 + rand.Float64()*80
+	if err := locator.PressSequentially(text, playwright.LocatorPressSequentiallyOptions{
+		Delay: playwright.Float(delay),
+	}); err != nil {
+		return err
+	}
+
+	humanPause()
+	return nil
+}
 
 func getImagesFromDOM(page playwright.Page) map[string]bool {
 	// Evaluates the DOM. Converts both standard base64 data URIs and object Blobs to Data URIs.

@@ -27,7 +27,20 @@ type PlaywrightManager struct {
 	Browser   playwright.Browser
 	Context   playwright.BrowserContext
 	mu        sync.Mutex
+
+	runMu   sync.Mutex
+	runPage playwright.Page
 }
+
+// captureState holds the GenerateContent response bodies seen since the last
+// run started. Runs are serialized, so a single shared bucket is safe.
+type captureState struct {
+	mu     sync.Mutex
+	bodies [][]byte
+	done   chan bool
+}
+
+var capture captureState
 
 var Manager *PlaywrightManager
 
@@ -102,6 +115,8 @@ func InitAndConnect() (*PlaywrightManager, error) {
 			pm.Cleanup()
 			return nil, err
 		}
+		applyStealthInitScripts(pm.Context)
+		applyResponseCaptureHook(pm.Context)
 
 		fmt.Println("Checking login status...")
 		loggedIn, err := pm.checkIfLoggedIn()
@@ -244,6 +259,91 @@ func (pm *PlaywrightManager) Cleanup() {
 	}
 }
 
+func applyStealthInitScripts(ctx playwright.BrowserContext) {
+	webdriverSpoof := "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+	if err := ctx.AddInitScript(playwright.Script{
+		Content: playwright.String(webdriverSpoof),
+	}); err != nil {
+		log.Printf("!! Failed to add init script: %v\n", err)
+	}
+}
+
+func applyResponseCaptureHook(ctx playwright.BrowserContext) {
+	ctx.OnResponse(func(response playwright.Response) {
+		if !strings.Contains(response.URL(), "GenerateContent") {
+			return
+		}
+		log.Println(">> [Net] Detected 'GenerateContent' stream...")
+
+		go func() {
+			body, err := response.Body()
+			if err != nil {
+				log.Printf("!! [Net] Error reading body: %v\n", err)
+				return
+			}
+
+			log.Printf(">> [Net] Stream closed. Captured %d bytes.\n", len(body))
+
+			if strings.Contains(string(body), "permission") || strings.Contains(string(body), "denied") {
+				log.Printf("!! [Net] Possible abuse/permission block in body: %s\n", truncate(string(body), 300))
+			}
+
+			capture.mu.Lock()
+			capture.bodies = append(capture.bodies, body)
+			capture.mu.Unlock()
+
+			select {
+			case capture.done <- true:
+			default:
+			}
+		}()
+	})
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+// AcquireRunPage returns the single long-lived AI Studio page, creating it if
+// needed. Runs are serialized on this page so repeated requests look like one
+// human working in one window instead of a fresh tab per request.
+func (pm *PlaywrightManager) AcquireRunPage() (playwright.Page, error) {
+	pm.runMu.Lock()
+
+	if pm.Context == nil || pm.Browser == nil || !pm.Browser.IsConnected() {
+		log.Println("Browser disconnected, attempting restart...")
+		pm.Cleanup()
+		newPm, err := InitAndConnect()
+		if err != nil {
+			pm.runMu.Unlock()
+			return nil, err
+		}
+		pm.pw = newPm.pw
+		pm.ChromeCmd = newPm.ChromeCmd
+		pm.Browser = newPm.Browser
+		pm.Context = newPm.Context
+		pm.runPage = newPm.runPage
+	}
+
+	if pm.runPage == nil || pm.runPage.IsClosed() {
+		page, err := pm.Context.NewPage()
+		if err != nil {
+			pm.runMu.Unlock()
+			return nil, err
+		}
+		pm.runPage = page
+	}
+
+	return pm.runPage, nil
+}
+
+func (pm *PlaywrightManager) ReleaseRunPage() {
+	pm.runMu.Unlock()
+}
+
 func (pm *PlaywrightManager) CreateNewPage() (playwright.Page, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -262,6 +362,9 @@ func (pm *PlaywrightManager) CreateNewPage() (playwright.Page, error) {
 		pm.ChromeCmd = newPm.ChromeCmd
 		pm.Browser = newPm.Browser
 		pm.Context = newPm.Context
+		applyStealthInitScripts(pm.Context)
+	} else {
+		applyStealthInitScripts(pm.Context)
 	}
 
 	if pm.Context == nil {
