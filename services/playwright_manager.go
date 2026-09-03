@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/playwright-community/playwright-go"
+	"github.com/mxschmitt/playwright-go"
 )
 
 const (
@@ -172,6 +172,7 @@ func runHeadfulLoginSession() error {
 
 	args := []string{
 		fmt.Sprintf("--user-data-dir=%s", userDataDir),
+		"--window-position=10000,10000",
 		fmt.Sprintf("--profile-directory=%s", CHROME_PROFILE_NAME),
 		NEW_PROMPT_PAGE,
 	}

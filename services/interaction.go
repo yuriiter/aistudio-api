@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"aistudio-api/openai"
-	"github.com/playwright-community/playwright-go"
+	"github.com/mxschmitt/playwright-go"
 )
 
 const (
